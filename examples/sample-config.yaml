@@ -20,3 +20,26 @@ backups:
       type: restic
       repo: <RESTIC_REPO>
       # group_by: host  # optional, default: "host"
+  #
+  # Longhorn-backed PVC --> Restic
+  #
+  # The home-backup CronJob acts as an orchestrator. It creates a CSI
+  # VolumeSnapshot, restores a temporary PVC beside the CronJob, and creates a
+  # child Job by copying the CronJob's complete JobSpec. The child gets one
+  # additional read-only PVC mount and a HOME_BACKUP_CONFIG_B64 override.
+  # The CronJob should set a stable RESTIC_HOST when using group_by: host.
+  # Completed or failed child Jobs are automatically deleted after three days.
+  #
+  - source:
+      type: longhorn_pvc
+      pvc_name: <PVC_NAME>
+      # namespace: <PVC_NAMESPACE> # optional, defaults to current pod namespace
+      snapshot_class: longhorn
+      # storage_class: longhorn # optional, defaults from source PVC
+      # mount_path: /backup-source # optional, default: /backup-source
+      # container_name: home-backup # optional, default: home-backup
+      # timeout: 30m # optional, default: 30m
+    destination:
+      type: restic
+      repo: <RESTIC_REPO>
+      # keep_last: 10 # optional, default: 10

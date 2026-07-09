@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,6 +14,10 @@ import (
 var sourceFields = map[SourceKind]map[string]struct{}{
 	SourceDirectory: {"type": {}, "path": {}},
 	SourceLVM:       {"type": {}, "vg_name": {}, "lv_name": {}},
+	SourceLonghornPVC: {
+		"type": {}, "pvc_name": {}, "namespace": {}, "snapshot_class": {},
+		"storage_class": {}, "mount_path": {}, "container_name": {}, "timeout": {},
+	},
 }
 
 var destinationFields = map[DestinationKind]map[string]struct{}{
@@ -41,6 +46,17 @@ type rawLVM struct {
 	Type   string `yaml:"type"`
 	VGName string `yaml:"vg_name"`
 	LVName string `yaml:"lv_name"`
+}
+
+type rawLonghornPVC struct {
+	Type          string `yaml:"type"`
+	PVCName       string `yaml:"pvc_name"`
+	Namespace     string `yaml:"namespace"`
+	SnapshotClass string `yaml:"snapshot_class"`
+	StorageClass  string `yaml:"storage_class"`
+	MountPath     string `yaml:"mount_path"`
+	ContainerName string `yaml:"container_name"`
+	Timeout       string `yaml:"timeout"`
 }
 
 type rawRestic struct {
@@ -136,6 +152,36 @@ func decodeSource(node yaml.Node) (Source, error) {
 			return Source{}, err
 		}
 		return Source{Kind: kind, LVM: &LVMSource{VGName: raw.VGName, LVName: raw.LVName}}, nil
+	case SourceLonghornPVC:
+		var raw rawLonghornPVC
+		if err := decodeMapping(node, allowed, true, "source", &raw); err != nil {
+			return Source{}, err
+		}
+		timeout := DefaultLonghornPVCTimeout
+		if raw.Timeout != "" {
+			parsed, err := time.ParseDuration(raw.Timeout)
+			if err != nil {
+				return Source{}, fmt.Errorf("parse timeout %q: %w", raw.Timeout, err)
+			}
+			timeout = parsed
+		}
+		mountPath := raw.MountPath
+		if mountPath == "" {
+			mountPath = DefaultLonghornPVCMountPath
+		}
+		containerName := raw.ContainerName
+		if containerName == "" {
+			containerName = DefaultLonghornPVCContainerName
+		}
+		return Source{Kind: kind, LonghornPVC: &LonghornPVCSource{
+			PVCName:       raw.PVCName,
+			Namespace:     raw.Namespace,
+			SnapshotClass: raw.SnapshotClass,
+			StorageClass:  raw.StorageClass,
+			MountPath:     mountPath,
+			ContainerName: containerName,
+			Timeout:       timeout,
+		}}, nil
 	default:
 		return Source{}, fmt.Errorf("unsupported source type %q", discriminator.Type)
 	}

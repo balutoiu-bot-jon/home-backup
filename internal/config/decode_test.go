@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadReadsConfigFile(t *testing.T) {
@@ -82,6 +83,62 @@ func TestDecodeAcceptsNumericKeepLast(t *testing.T) {
 	}
 }
 
+func TestDecodeLonghornPVCSource(t *testing.T) {
+	t.Parallel()
+
+	yaml := `backups:
+  - source:
+      type: longhorn_pvc
+      pvc_name: photos
+      namespace: media
+      snapshot_class: longhorn-snapshot-vsc
+    destination:
+      type: restic
+      repo: /repo
+`
+	cfg, err := Decode(strings.NewReader(yaml), "test.yaml")
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	got := cfg.Backups[0].Source
+	if got.Kind != SourceLonghornPVC || got.LonghornPVC == nil {
+		t.Fatalf("Longhorn source = %#v", got)
+	}
+	if got.LonghornPVC.PVCName != "photos" || got.LonghornPVC.Namespace != "media" {
+		t.Fatalf("Longhorn source identity = %#v", got.LonghornPVC)
+	}
+	if got.LonghornPVC.MountPath != DefaultLonghornPVCMountPath || got.LonghornPVC.Timeout != DefaultLonghornPVCTimeout {
+		t.Fatalf("Longhorn source defaults = %#v", got.LonghornPVC)
+	}
+	if got.LonghornPVC.ContainerName != DefaultLonghornPVCContainerName {
+		t.Fatalf("Longhorn child container default = %#v", got.LonghornPVC)
+	}
+}
+
+func TestDecodeLonghornPVCSourceOverrides(t *testing.T) {
+	t.Parallel()
+
+	yaml := `backups:
+  - source:
+      type: longhorn_pvc
+      pvc_name: photos
+      snapshot_class: longhorn-snapshot-vsc
+      storage_class: longhorn-2r
+      mount_path: /snapshot
+      container_name: backup
+      timeout: 45m
+    destination: {type: restic, repo: /repo}
+`
+	cfg, err := Decode(strings.NewReader(yaml), "test.yaml")
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	got := cfg.Backups[0].Source.LonghornPVC
+	if got.StorageClass != "longhorn-2r" || got.MountPath != "/snapshot" || got.ContainerName != "backup" || got.Timeout != 45*time.Minute {
+		t.Fatalf("Longhorn source overrides = %#v", got)
+	}
+}
+
 func TestDecodeRejectsInvalidConfig(t *testing.T) {
 	t.Parallel()
 
@@ -95,6 +152,16 @@ func TestDecodeRejectsInvalidConfig(t *testing.T) {
 		{name: "unknown source field", yaml: "backups:\n- source: {type: directory, path: /tmp, typo: value}\n  destination: {type: restic, repo: /repo}\n", want: "unknown source field"},
 		{name: "unknown source type", yaml: "backups:\n- source: {type: zfs}\n  destination: {type: restic, repo: /repo}\n", want: "unsupported source type"},
 		{name: "missing directory path", yaml: "backups:\n- source: {type: directory}\n  destination: {type: restic, repo: /repo}\n", want: "directory source path is required"},
+		{name: "missing PVC name", yaml: "backups:\n- source: {type: longhorn_pvc, snapshot_class: snap}\n  destination: {type: restic, repo: /repo}\n", want: "pvc_name is required"},
+		{name: "missing snapshot class", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data}\n  destination: {type: restic, repo: /repo}\n", want: "snapshot_class is required"},
+		{name: "non-positive Longhorn timeout", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, timeout: 0s}\n  destination: {type: restic, repo: /repo}\n", want: "timeout must be greater than zero"},
+		{name: "invalid Longhorn timeout", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, timeout: never}\n  destination: {type: restic, repo: /repo}\n", want: "parse timeout"},
+		{name: "invalid Longhorn namespace", yaml: "backups:\n- source: {type: longhorn_pvc, namespace: Bad_Name, pvc_name: data, snapshot_class: snap}\n  destination: {type: restic, repo: /repo}\n", want: "namespace must be a valid DNS-1123 label"},
+		{name: "invalid Longhorn PVC name", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: Bad_Name, snapshot_class: snap}\n  destination: {type: restic, repo: /repo}\n", want: "pvc_name must be a valid DNS-1123 subdomain"},
+		{name: "invalid Longhorn snapshot class", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: Bad_Name}\n  destination: {type: restic, repo: /repo}\n", want: "snapshot_class must be a valid DNS-1123 subdomain"},
+		{name: "invalid Longhorn storage class", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, storage_class: Bad_Name}\n  destination: {type: restic, repo: /repo}\n", want: "storage_class must be a valid DNS-1123 subdomain"},
+		{name: "relative Longhorn mount path", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, mount_path: relative}\n  destination: {type: restic, repo: /repo}\n", want: "mount_path must be absolute"},
+		{name: "invalid Longhorn container name", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, container_name: Bad_Name}\n  destination: {type: restic, repo: /repo}\n", want: "container_name must be a valid DNS-1123 label"},
 		{name: "negative retention", yaml: "backups:\n- source: {type: directory, path: /tmp}\n  destination: {type: restic, repo: /repo, keep_last: -1}\n", want: "keep_last cannot be negative"},
 		{name: "multiple documents", yaml: "backups:\n- source: {type: directory, path: /tmp}\n  destination: {type: restic, repo: /repo}\n---\nbackups: []\n", want: "multiple YAML documents"},
 	}

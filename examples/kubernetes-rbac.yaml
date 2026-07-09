@@ -1,0 +1,121 @@
+# Replace `backup` with the namespace containing the home-backup CronJob and
+# `media` with the namespace containing the source PVC. If they are the same,
+# the two namespaced Roles may be combined.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: home-backup-longhorn-runner
+  namespace: backup
+rules:
+  # Required to detect the current CronJob through Pod -> Job -> CronJob owners.
+  - apiGroups: [""]
+    resources:
+      - pods
+    verbs:
+      - get
+  - apiGroups: [""]
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - create
+      - delete
+  - apiGroups:
+      - batch
+    resources:
+      - cronjobs
+    verbs:
+      - get
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - get
+      - create
+      - delete
+  - apiGroups:
+      - snapshot.storage.k8s.io
+    resources:
+      - volumesnapshots
+    verbs:
+      - get
+      - create
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: home-backup-longhorn-runner
+  namespace: backup
+subjects:
+  - kind: ServiceAccount
+    name: home-backup
+    namespace: backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: home-backup-longhorn-runner
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: home-backup-longhorn-source
+  namespace: media
+rules:
+  - apiGroups: [""]
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+  - apiGroups:
+      - snapshot.storage.k8s.io
+    resources:
+      - volumesnapshots
+    verbs:
+      - get
+      - create
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: home-backup-longhorn-source
+  namespace: media
+subjects:
+  - kind: ServiceAccount
+    name: home-backup
+    namespace: backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: home-backup-longhorn-source
+---
+# VolumeSnapshotContent is cluster-scoped. The alias uses deletionPolicy Retain
+# and is deleted explicitly after the restored PVC is removed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: home-backup-longhorn-snapshot-alias
+rules:
+  - apiGroups:
+      - snapshot.storage.k8s.io
+    resources:
+      - volumesnapshotcontents
+    verbs:
+      - get
+      - create
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: home-backup-longhorn-snapshot-alias
+subjects:
+  - kind: ServiceAccount
+    name: home-backup
+    namespace: backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: home-backup-longhorn-snapshot-alias

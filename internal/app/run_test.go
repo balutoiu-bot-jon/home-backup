@@ -3,12 +3,15 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ionutbalutoiu/home-backup/internal/config"
 )
 
 func TestParseOptionsRequiresConfig(t *testing.T) {
@@ -49,6 +52,31 @@ func TestParseOptionsRejectsInvalidLogLevel(t *testing.T) {
 	}
 }
 
+func TestRunPrefersBase64Config(t *testing.T) {
+	yaml := "backups:\n" +
+		"  - source: {type: directory, path: " + t.TempDir() + "}\n" +
+		"    destination: {type: restic, repo: /repo}\n"
+	encoded := base64.StdEncoding.EncodeToString([]byte(yaml))
+	runner := &fakeRunner{}
+
+	err := run(context.Background(), []string{"-config", "/does/not/exist"}, io.Discard, &bytes.Buffer{}, runtimeDependencies{
+		newRunner: func(*slog.Logger) commandRunner { return runner },
+		euid:      func() int { return 1000 },
+		lookupEnv: func(name string) (string, bool) {
+			if name == config.EnvConfigBase64 {
+				return encoded, true
+			}
+			return "", false
+		},
+	})
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if len(runner.specs) != 3 {
+		t.Fatalf("commands = %#v, want Restic check, backup, and retention", runner.specs)
+	}
+}
+
 func TestRunLoadsBuildsAndExecutesJobs(t *testing.T) {
 	sourcePath := t.TempDir()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -67,6 +95,7 @@ func TestRunLoadsBuildsAndExecutesJobs(t *testing.T) {
 	err := run(context.Background(), []string{"-config", configPath}, io.Discard, &bytes.Buffer{}, runtimeDependencies{
 		newRunner: func(*slog.Logger) commandRunner { return runner },
 		euid:      func() int { return 1000 },
+		lookupEnv: func(string) (string, bool) { return "", false },
 	})
 	if err != nil {
 		t.Fatalf("run() error = %v", err)
