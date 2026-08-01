@@ -36,9 +36,12 @@ type recordingCluster struct {
 	cronJob            *batchv1.CronJob
 	nonterminalWait    bool
 	jobLogs            string
+	deleteJobDelay     time.Duration
 	cleanupCanceled    bool
 	cleanupScopes      []string
 	aliasTargetNS      string
+	runDeadline        time.Time
+	hasRunDeadline     bool
 }
 
 func (f *recordingCluster) record(call string) error {
@@ -53,7 +56,8 @@ func (f *recordingCluster) recordCleanup(ctx context.Context, call string) error
 	return f.record(call)
 }
 
-func (f *recordingCluster) ReconcileStaleRuns(context.Context, string, []string, time.Duration) error {
+func (f *recordingCluster) ReconcileStaleRuns(ctx context.Context, _ string, _ []string, _ time.Duration) error {
+	f.runDeadline, f.hasRunDeadline = ctx.Deadline()
 	return f.record("reconcile-stale-runs")
 }
 
@@ -120,6 +124,9 @@ func (f *recordingCluster) CreateChildConfigSecret(_ context.Context, secret *co
 	f.childConfigSecret = secret.DeepCopy()
 	return f.record("create-secret")
 }
+func (f *recordingCluster) ValidateChildJob(_ context.Context, _ *batchv1.Job) error {
+	return f.failAt["validate-job"]
+}
 func (f *recordingCluster) CreateChildJob(_ context.Context, job *batchv1.Job) error {
 	f.childJob = job.DeepCopy()
 	return f.record("create-job")
@@ -137,11 +144,18 @@ func (f *recordingCluster) JobPodLogs(context.Context, string, string, string) (
 }
 func (f *recordingCluster) DeleteJob(ctx context.Context, _, _, _, runnerScope string) error {
 	f.cleanupScopes = append(f.cleanupScopes, runnerScope)
-	return f.recordCleanup(ctx, "delete-job")
-}
-func (f *recordingCluster) DeleteJobPods(ctx context.Context, _, _, _, runnerScope string) error {
-	f.cleanupScopes = append(f.cleanupScopes, runnerScope)
-	return f.recordCleanup(ctx, "delete-job-pods")
+	if err := f.recordCleanup(ctx, "delete-job"); err != nil {
+		return err
+	}
+	if f.deleteJobDelay <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(f.deleteJobDelay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 func (f *recordingCluster) DeleteSecret(ctx context.Context, _, _, _, runnerScope string) error {
 	f.cleanupScopes = append(f.cleanupScopes, runnerScope)
@@ -162,6 +176,42 @@ func (f *recordingCluster) DeleteSnapshotContent(ctx context.Context, _, _, runn
 	f.cleanupScopes = append(f.cleanupScopes, runnerScope)
 	f.aliasTargetNS = targetNamespace
 	return f.recordCleanup(ctx, "delete-alias-content")
+}
+
+func TestCleanupBudgetsFitParentGraceAndAllowForegroundDeletionOverhead(t *testing.T) {
+	childGrace := time.Duration(homekube.ChildJobTerminationGraceSeconds) * time.Second
+	parentGrace := time.Duration(homekube.ParentMinimumGraceSeconds) * time.Second
+	if childShutdownTimeout <= childGrace {
+		t.Fatalf("child shutdown timeout = %s, must exceed Pod grace %s for foreground deletion overhead", childShutdownTimeout, childGrace)
+	}
+	if total := childShutdownTimeout + cleanupTimeout; total >= parentGrace {
+		t.Fatalf("sequential cleanup budgets = %s, must leave process margin under parent grace %s", total, parentGrace)
+	}
+}
+
+func TestJobRunHasEndToEndDeadlineBelowStaleWindow(t *testing.T) {
+	cluster := &recordingCluster{failAt: map[string]error{}}
+	started := time.Now()
+	if err := newTestJob(cluster, "source").Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !cluster.hasRunDeadline {
+		t.Fatal("Run() did not apply an end-to-end deadline")
+	}
+	duration := cluster.runDeadline.Sub(started)
+	if duration > maxLiveRunDuration+time.Second || duration+childShutdownTimeout+cleanupTimeout >= staleRunAge {
+		t.Fatalf("run deadline duration = %s, does not leave safe cleanup margin below stale age %s", duration, staleRunAge)
+	}
+}
+
+func TestNewJobRejectsTimeoutThatCanOutliveStaleSafetyWindow(t *testing.T) {
+	_, err := NewJob(Config{
+		PVCName: "data", SnapshotClass: "longhorn", MountPath: "/backup-source",
+		ContainerName: "home-backup", Timeout: maxLonghornWaitTimeout + time.Second,
+	}, ResticDestination{Repo: "s3:test", GroupBy: "host"}, &recordingCluster{}, "backup")
+	if err == nil || !strings.Contains(err.Error(), maxLonghornWaitTimeout.String()) {
+		t.Fatalf("NewJob() error = %v, want stale-window timeout rejection", err)
+	}
 }
 
 func TestNewJobRejectsResticGroupingWithoutHost(t *testing.T) {
@@ -251,7 +301,7 @@ func TestJobCopiesCronJobSpecIntoChildJob(t *testing.T) {
 	want := []string{
 		"reconcile-stale-runs", "resolve-cronjob", "get-pvc", "create-source-snapshot", "wait-source-snapshot",
 		"create-alias-content", "create-alias-snapshot", "wait-alias-snapshot",
-		"create-pvc", "create-secret", "create-job", "wait-job", "job-pod-logs", "delete-job-pods",
+		"create-pvc", "create-secret", "create-job", "wait-job", "job-pod-logs", "delete-job",
 		"delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot",
 	}
 	if !reflect.DeepEqual(cluster.calls, want) {
@@ -275,7 +325,7 @@ func TestJobCopiesCronJobSpecIntoChildJob(t *testing.T) {
 	if cluster.childConfigSecret == nil || cluster.childConfigSecret.Name != "home-backup-data-fixed-config" || len(cluster.childConfigSecret.Data[homekube.ChildConfigSecretKey]) == 0 {
 		t.Fatalf("child config Secret = %#v", cluster.childConfigSecret)
 	}
-	if cluster.childJob.Labels[homekube.RunLabel] != "home-backup-data-fixed" || cluster.childJob.Spec.TTLSecondsAfterFinished == nil || *cluster.childJob.Spec.TTLSecondsAfterFinished != homekube.ChildJobTTLSeconds {
+	if cluster.childJob.Labels[homekube.RunLabel] != "home-backup-data-fixed" || cluster.childJob.Spec.TTLSecondsAfterFinished != nil {
 		t.Fatalf("child Job ownership/TTL = %#v / %v", cluster.childJob.Labels, cluster.childJob.Spec.TTLSecondsAfterFinished)
 	}
 	wantScope := homekube.RunnerScope("runner")
@@ -304,7 +354,7 @@ func TestJobSameNamespaceSkipsSnapshotAlias(t *testing.T) {
 	}
 }
 
-func TestJobFailureLeavesChildJobForTTLAndCleansStorage(t *testing.T) {
+func TestJobFailureDeletesChildJobBeforeStorage(t *testing.T) {
 	cluster := &recordingCluster{failAt: map[string]error{"wait-job": errors.New("backup failed")}}
 	err := newTestJob(cluster, "source").Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "backup failed") {
@@ -313,14 +363,24 @@ func TestJobFailureLeavesChildJobForTTLAndCleansStorage(t *testing.T) {
 	if !strings.Contains(err.Error(), "restic child output") {
 		t.Fatalf("Run() error does not include child logs: %v", err)
 	}
-	wantTail := []string{"job-pod-logs", "delete-job-pods", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}
+	wantTail := []string{"job-pod-logs", "delete-job", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}
 	if got := cluster.calls[len(cluster.calls)-len(wantTail):]; !reflect.DeepEqual(got, wantTail) {
 		t.Fatalf("cleanup calls = %#v, want %#v", got, wantTail)
 	}
-	for _, call := range cluster.calls {
-		if call == "delete-job" {
-			t.Fatalf("child Job was explicitly deleted: %#v", cluster.calls)
-		}
+}
+
+func TestJobDeleteFailureStopsDependentCleanup(t *testing.T) {
+	cluster := &recordingCluster{failAt: map[string]error{
+		"wait-job":   errors.New("backup failed"),
+		"delete-job": errors.New("foreground deletion blocked"),
+	}}
+	err := newTestJob(cluster, "source").Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "backup failed") || !strings.Contains(err.Error(), "foreground deletion blocked") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	wantTail := []string{"job-pod-logs", "delete-job"}
+	if got := cluster.calls[len(cluster.calls)-len(wantTail):]; !reflect.DeepEqual(got, wantTail) {
+		t.Fatalf("cleanup calls = %#v, want tail %#v with no dependent cleanup", got, wantTail)
 	}
 }
 
@@ -350,15 +410,52 @@ func TestJobNonterminalFailureDeletesChildBeforeStorage(t *testing.T) {
 	}
 }
 
-func TestJobAmbiguousCreateDeletesChildBeforeStorage(t *testing.T) {
+func TestJobNonterminalChildShutdownGetsDedicatedBudgetBeforeResourceCleanup(t *testing.T) {
+	cluster := &recordingCluster{
+		failAt:          map[string]error{"wait-job": errors.New("wait canceled")},
+		nonterminalWait: true,
+		deleteJobDelay:  40 * time.Millisecond,
+	}
+	job := newTestJob(cluster, "source")
+	job.cleanupTimeout = 30 * time.Millisecond
+
+	err := job.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "wait canceled") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	wantTail := []string{"delete-job", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}
+	if len(cluster.calls) < len(wantTail) {
+		t.Fatalf("cleanup calls = %#v, want tail %#v", cluster.calls, wantTail)
+	}
+	if got := cluster.calls[len(cluster.calls)-len(wantTail):]; !reflect.DeepEqual(got, wantTail) {
+		t.Fatalf("cleanup calls = %#v, want tail %#v", got, wantTail)
+	}
+	if cluster.cleanupCanceled {
+		t.Fatal("storage cleanup context expired during child Job deletion instead of starting afterward")
+	}
+}
+
+func TestJobCompatibilityProbeFailsBeforeAllocations(t *testing.T) {
+	cluster := &recordingCluster{failAt: map[string]error{"validate-job": errors.New("unsupported podReplacementPolicy")}}
+	err := newTestJob(cluster, "source").Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unsupported podReplacementPolicy") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, call := range cluster.calls {
+		if strings.HasPrefix(call, "create-") {
+			t.Fatalf("compatibility probe allocated resources: %#v", cluster.calls)
+		}
+	}
+}
+
+func TestJobAmbiguousCreatePreservesDependencies(t *testing.T) {
 	cluster := &recordingCluster{failAt: map[string]error{"create-job": errors.New("transport error")}}
 	err := newTestJob(cluster, "source").Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "transport error") {
 		t.Fatalf("Run() error = %v", err)
 	}
-	wantTail := []string{"create-job", "delete-job", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}
-	if got := cluster.calls[len(cluster.calls)-len(wantTail):]; !reflect.DeepEqual(got, wantTail) {
-		t.Fatalf("cleanup calls = %#v, want %#v", got, wantTail)
+	if got := cluster.calls[len(cluster.calls)-1:]; !reflect.DeepEqual(got, []string{"create-job"}) {
+		t.Fatalf("calls = %#v, want unresolved create to preserve every dependency", got)
 	}
 }
 
@@ -367,20 +464,26 @@ func TestJobCancellationAtEachAllocationStageUsesFreshDependencyOrderedCleanup(t
 		stage   string
 		cleanup []string
 	}{
-		{stage: "create-source-snapshot", cleanup: []string{"delete-source-snapshot"}},
+		{stage: "create-source-snapshot"},
 		{stage: "wait-source-snapshot", cleanup: []string{"delete-source-snapshot"}},
-		{stage: "create-alias-content", cleanup: []string{"delete-alias-content", "delete-source-snapshot"}},
-		{stage: "create-alias-snapshot", cleanup: []string{"delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}},
+		{stage: "create-alias-content"},
+		{stage: "create-alias-snapshot"},
 		{stage: "wait-alias-snapshot", cleanup: []string{"delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}},
-		{stage: "create-pvc", cleanup: []string{"delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}},
-		{stage: "create-secret", cleanup: []string{"delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}},
-		{stage: "create-job", cleanup: []string{"delete-job", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}},
+		{stage: "create-pvc"},
+		{stage: "create-secret"},
+		{stage: "create-job"},
 	} {
 		t.Run(test.stage, func(t *testing.T) {
 			cluster := &recordingCluster{failAt: map[string]error{test.stage: context.Canceled}}
 			err := newTestJob(cluster, "source").Run(context.Background())
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Run() error = %v", err)
+			}
+			if test.cleanup == nil {
+				if cluster.calls[len(cluster.calls)-1] != test.stage {
+					t.Fatalf("calls = %#v, want unresolved create to preserve every dependency", cluster.calls)
+				}
+				return
 			}
 			if len(cluster.calls) < len(test.cleanup) {
 				t.Fatalf("calls = %#v", cluster.calls)

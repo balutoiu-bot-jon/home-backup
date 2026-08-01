@@ -31,8 +31,8 @@ backups:
   # The selected child container gets a stable source-specific RESTIC_HOST.
   # Set the parent CronJob Job template terminationGracePeriodSeconds to at
   # least 300; home-backup fails before snapshot creation otherwise.
-  # Bounded terminal Pod logs are captured before the Pod is deleted for PVC cleanup;
-  # the completed or failed child Job metadata is deleted after three days.
+  # Bounded terminal Pod logs are captured before the child Job is deleted with
+  # foreground propagation; Kubernetes removes its Pod before PVC cleanup begins.
   # Abandoned labeled resources older than 24 hours are swept before a new run.
   #
   - source:

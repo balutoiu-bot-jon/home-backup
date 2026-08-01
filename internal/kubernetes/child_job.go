@@ -12,7 +12,6 @@ import (
 )
 
 const (
-	ChildJobTTLSeconds              int32 = 3 * 24 * 60 * 60
 	ChildJobTerminationGraceSeconds int64 = 150
 	ParentMinimumGraceSeconds       int64 = 300
 	ChildConfigSecretKey                  = "config-b64"
@@ -43,7 +42,7 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 	}
 	parentGrace := opts.CronJob.Spec.JobTemplate.Spec.Template.Spec.TerminationGracePeriodSeconds
 	if parentGrace == nil || *parentGrace < ParentMinimumGraceSeconds {
-		return nil, fmt.Errorf("parent CronJob Job template terminationGracePeriodSeconds must be at least %d seconds (120-second cleanup, 150-second child shutdown, and 30-second margin)", ParentMinimumGraceSeconds)
+		return nil, fmt.Errorf("parent CronJob Job template terminationGracePeriodSeconds must be at least %d seconds (165-second foreground child Job deletion, 120-second dependency cleanup, and 15-second margin)", ParentMinimumGraceSeconds)
 	}
 
 	jobSpec := *opts.CronJob.Spec.JobTemplate.Spec.DeepCopy()
@@ -53,6 +52,7 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 			return nil, fmt.Errorf("CronJob uses native restartable init container %q; exact-once child Jobs require ordinary init containers", initContainer.Name)
 		}
 	}
+	disableContainerRestarts(&jobSpec.Template.Spec)
 	singleton := int32(1)
 	zero := int32(0)
 	falseValue := false
@@ -65,12 +65,18 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 	jobSpec.SuccessPolicy = nil
 	jobSpec.CompletionMode = nil
 	jobSpec.Suspend = &falseValue
-	jobSpec.PodReplacementPolicy = nil
+	replaceFailed := batchv1.Failed
+	jobSpec.PodReplacementPolicy = &replaceFailed
 	jobSpec.ManagedBy = nil
+	jobSpec.Selector = nil
+	jobSpec.ManualSelector = nil
 	jobSpec.Template.Labels = maps.Clone(jobSpec.Template.Labels)
+	jobSpec.Template.Annotations = maps.Clone(jobSpec.Template.Annotations)
 	if jobSpec.Template.Labels == nil {
 		jobSpec.Template.Labels = make(map[string]string, 2)
 	}
+	removeJobControllerLabels(jobSpec.Template.Labels)
+	removeJobControllerAnnotations(jobSpec.Template.Annotations)
 	jobSpec.Template.Labels[ManagedByLabel] = ManagedByLabelValue
 	jobSpec.Template.Labels[RunLabel] = opts.RunID
 	jobSpec.Template.Labels[RunnerScopeLabel] = runnerScope
@@ -84,8 +90,7 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 	if err := validateSnapshotMount(jobSpec.Template.Spec, containerIndex, opts.MountPath); err != nil {
 		return nil, err
 	}
-	ttlSeconds := ChildJobTTLSeconds
-	jobSpec.TTLSecondsAfterFinished = &ttlSeconds
+	jobSpec.TTLSecondsAfterFinished = nil
 	jobSpec.Template.Spec.Volumes = append(jobSpec.Template.Spec.Volumes, corev1.Volume{
 		Name: TempVolumeName,
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
@@ -112,6 +117,9 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 	if labels == nil {
 		labels = make(map[string]string, 2)
 	}
+	removeJobControllerLabels(labels)
+	annotations := maps.Clone(opts.CronJob.Spec.JobTemplate.Annotations)
+	removeJobControllerAnnotations(annotations)
 	labels[ManagedByLabel] = ManagedByLabelValue
 	labels[RunLabel] = opts.RunID
 	labels[RunnerScopeLabel] = runnerScope
@@ -121,31 +129,50 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 			Name:        opts.Name,
 			Namespace:   opts.CronJob.Namespace,
 			Labels:      labels,
-			Annotations: maps.Clone(opts.CronJob.Spec.JobTemplate.Annotations),
+			Annotations: annotations,
 		},
 		Spec: jobSpec,
 	}, nil
 }
 
+func removeJobControllerLabels(labels map[string]string) {
+	for _, label := range []string{
+		batchv1.ControllerUidLabel, batchv1.JobNameLabel, "controller-uid", "job-name",
+		"pod-template-hash", "controller-revision-hash", "statefulset.kubernetes.io/pod-name",
+		"apps.kubernetes.io/pod-index", "batch.kubernetes.io/job-completion-index",
+	} {
+		delete(labels, label)
+	}
+}
+
+func removeJobControllerAnnotations(annotations map[string]string) {
+	delete(annotations, "batch.kubernetes.io/job-completion-index")
+}
+
 func disableServiceAccountTokens(podSpec *corev1.PodSpec) {
 	falseValue := false
 	podSpec.AutomountServiceAccountToken = &falseValue
-	tokenVolumes := make(map[string]struct{})
-	podSpec.Volumes = slices.DeleteFunc(podSpec.Volumes, func(volume corev1.Volume) bool {
+	tokenOnlyVolumes := make(map[string]struct{})
+	filteredVolumes := make([]corev1.Volume, 0, len(podSpec.Volumes))
+	for _, volume := range podSpec.Volumes {
 		if volume.Projected == nil {
-			return false
+			filteredVolumes = append(filteredVolumes, volume)
+			continue
 		}
-		for _, source := range volume.Projected.Sources {
-			if source.ServiceAccountToken != nil {
-				tokenVolumes[volume.Name] = struct{}{}
-				return true
-			}
+		originalSourceCount := len(volume.Projected.Sources)
+		volume.Projected.Sources = slices.DeleteFunc(volume.Projected.Sources, func(source corev1.VolumeProjection) bool {
+			return source.ServiceAccountToken != nil
+		})
+		if originalSourceCount > 0 && len(volume.Projected.Sources) == 0 {
+			tokenOnlyVolumes[volume.Name] = struct{}{}
+			continue
 		}
-		return false
-	})
+		filteredVolumes = append(filteredVolumes, volume)
+	}
+	podSpec.Volumes = filteredVolumes
 	removeTokenMounts := func(mounts []corev1.VolumeMount) []corev1.VolumeMount {
 		return slices.DeleteFunc(mounts, func(mount corev1.VolumeMount) bool {
-			_, remove := tokenVolumes[mount.Name]
+			_, remove := tokenOnlyVolumes[mount.Name]
 			return remove
 		})
 	}
@@ -157,6 +184,17 @@ func disableServiceAccountTokens(podSpec *corev1.PodSpec) {
 	}
 	for i := range podSpec.EphemeralContainers {
 		podSpec.EphemeralContainers[i].VolumeMounts = removeTokenMounts(podSpec.EphemeralContainers[i].VolumeMounts)
+	}
+}
+
+func disableContainerRestarts(podSpec *corev1.PodSpec) {
+	for i := range podSpec.InitContainers {
+		podSpec.InitContainers[i].RestartPolicy = nil
+		podSpec.InitContainers[i].RestartPolicyRules = nil
+	}
+	for i := range podSpec.Containers {
+		podSpec.Containers[i].RestartPolicy = nil
+		podSpec.Containers[i].RestartPolicyRules = nil
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 func TestBuildChildJobCopiesCronJobSpecAndAddsSnapshotBackup(t *testing.T) {
 	backoffLimit := int32(4)
 	parallelism := int32(2)
+	parentTTL := int32(999)
 	terminationGrace := ParentMinimumGraceSeconds
 	cronJob := &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "home-backup", Namespace: "backup"},
@@ -24,8 +25,9 @@ func TestBuildChildJobCopiesCronJobSpecAndAddsSnapshotBackup(t *testing.T) {
 				Annotations: map[string]string{"example.com/template": "kept"},
 			},
 			Spec: batchv1.JobSpec{
-				BackoffLimit: &backoffLimit,
-				Parallelism:  &parallelism,
+				BackoffLimit:            &backoffLimit,
+				Parallelism:             &parallelism,
+				TTLSecondsAfterFinished: &parentTTL,
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "home-backup"}},
 					Spec: corev1.PodSpec{
@@ -71,8 +73,8 @@ func TestBuildChildJobCopiesCronJobSpecAndAddsSnapshotBackup(t *testing.T) {
 	if job.Name != "home-backup-data-fixed-job" || job.Namespace != "backup" {
 		t.Fatalf("job identity = %s/%s", job.Namespace, job.Name)
 	}
-	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != ChildJobTTLSeconds {
-		t.Fatalf("TTLSecondsAfterFinished = %v", job.Spec.TTLSecondsAfterFinished)
+	if job.Spec.TTLSecondsAfterFinished != nil {
+		t.Fatalf("TTLSecondsAfterFinished retained from parent = %v", *job.Spec.TTLSecondsAfterFinished)
 	}
 	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 || job.Spec.Parallelism == nil || *job.Spec.Parallelism != 1 || job.Spec.Completions == nil || *job.Spec.Completions != 1 {
 		t.Fatalf("copied Job settings = %#v", job.Spec)
@@ -105,8 +107,11 @@ func TestBuildChildJobCopiesCronJobSpecAndAddsSnapshotBackup(t *testing.T) {
 		t.Fatalf("snapshot volume = %#v", volume)
 	}
 	expectedSpec := *original.Spec.JobTemplate.Spec.DeepCopy()
-	expectedTTL := ChildJobTTLSeconds
-	expectedSpec.TTLSecondsAfterFinished = &expectedTTL
+	expectedSpec.TTLSecondsAfterFinished = nil
+	expectedReplacement := batchv1.Failed
+	expectedSpec.PodReplacementPolicy = &expectedReplacement
+	expectedSpec.Selector = nil
+	expectedSpec.ManualSelector = nil
 	singleton := int32(1)
 	expectedSpec.Parallelism = &singleton
 	expectedSpec.Completions = &singleton
@@ -147,10 +152,12 @@ func TestBuildChildJobCopiesCronJobSpecAndAddsSnapshotBackup(t *testing.T) {
 func TestBuildChildJobRemovesServiceAccountTokensFromEveryContainerClass(t *testing.T) {
 	tokenVolume := "kube-api-access-parent"
 	unrelatedProjected := "projected-app-config"
+	mixedProjected := "projected-mixed"
 	resticSecret := "restic-credentials"
 	mounts := []corev1.VolumeMount{
 		{Name: tokenVolume, MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 		{Name: unrelatedProjected, MountPath: "/var/run/app-config", ReadOnly: true},
+		{Name: mixedProjected, MountPath: "/var/run/mixed", ReadOnly: true},
 	}
 	cronJob := &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "home-backup", Namespace: "backup"},
@@ -176,6 +183,10 @@ func TestBuildChildJobRemovesServiceAccountTokensFromEveryContainerClass(t *test
 					{Name: unrelatedProjected, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
 						ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "app-config"}},
 					}}}}},
+					{Name: mixedProjected, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{
+						{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token"}},
+						{Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "application-secret"}}},
+					}}}},
 					{Name: resticSecret, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: resticSecret}}},
 				},
 			}},
@@ -202,9 +213,14 @@ func TestBuildChildJobRemovesServiceAccountTokensFromEveryContainerClass(t *test
 			t.Fatalf("service-account-token projected volume survived: %#v", volume)
 		}
 	}
-	for _, name := range []string{unrelatedProjected, resticSecret, TempVolumeName} {
+	for _, name := range []string{unrelatedProjected, mixedProjected, resticSecret, TempVolumeName} {
 		if !hasVolume(podSpec.Volumes, name) {
 			t.Fatalf("unrelated volume %q was removed: %#v", name, podSpec.Volumes)
+		}
+	}
+	for _, volume := range podSpec.Volumes {
+		if volume.Name == mixedProjected && (volume.Projected == nil || len(volume.Projected.Sources) != 1 || volume.Projected.Sources[0].Secret == nil) {
+			t.Fatalf("mixed projection did not preserve only its unrelated source: %#v", volume)
 		}
 	}
 	assertMounts := func(class, name string, volumeMounts []corev1.VolumeMount) {
@@ -214,6 +230,9 @@ func TestBuildChildJobRemovesServiceAccountTokensFromEveryContainerClass(t *test
 		}
 		if !hasVolumeMount(volumeMounts, unrelatedProjected) {
 			t.Fatalf("%s container %q lost unrelated projected mount: %#v", class, name, volumeMounts)
+		}
+		if !hasVolumeMount(volumeMounts, mixedProjected) {
+			t.Fatalf("%s container %q lost mixed projected mount: %#v", class, name, volumeMounts)
 		}
 	}
 	for _, container := range podSpec.InitContainers {
@@ -257,6 +276,9 @@ func TestBuildChildJobNormalizesEveryControllerFieldToAtMostOnePod(t *testing.T)
 	indexed := batchv1.IndexedCompletion
 	failedIndexes := int32(2)
 	replaceFailed := batchv1.Failed
+	restartAlways := corev1.ContainerRestartPolicyAlways
+	restartOnFailure := corev1.ContainerRestartPolicyOnFailure
+	restartRules := []corev1.ContainerRestartRule{{Action: corev1.ContainerRestartRuleActionRestart}}
 	cronJob := &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "home-backup", Namespace: "backup"},
 		Spec: batchv1.CronJobSpec{JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
@@ -276,10 +298,23 @@ func TestBuildChildJobNormalizesEveryControllerFieldToAtMostOnePod(t *testing.T)
 			}}},
 			SuccessPolicy:        &batchv1.SuccessPolicy{Rules: []batchv1.SuccessPolicyRule{{SucceededCount: &one}}},
 			PodReplacementPolicy: &replaceFailed,
-			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			ManualSelector:       &trueValue,
+			Selector:             &metav1.LabelSelector{MatchLabels: map[string]string{"shared": "selector"}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					"custom": "preserved", batchv1.ControllerUidLabel: "parent-controller", batchv1.JobNameLabel: "parent-job",
+					"controller-uid": "legacy-parent-controller", "job-name": "legacy-parent-job",
+					"pod-template-hash": "parent-hash", "batch.kubernetes.io/job-completion-index": "3",
+				},
+				Annotations: map[string]string{"custom": "preserved", "batch.kubernetes.io/job-completion-index": "3"},
+			}, Spec: corev1.PodSpec{
 				RestartPolicy:                 corev1.RestartPolicyOnFailure,
 				TerminationGracePeriodSeconds: ptr.To(ParentMinimumGraceSeconds),
-				Containers:                    []corev1.Container{{Name: "home-backup"}},
+				InitContainers:                []corev1.Container{{Name: "prepare", RestartPolicy: &restartOnFailure, RestartPolicyRules: restartRules}},
+				Containers: []corev1.Container{
+					{Name: "home-backup", RestartPolicy: &restartAlways, RestartPolicyRules: restartRules},
+					{Name: "helper", RestartPolicy: &restartOnFailure, RestartPolicyRules: restartRules},
+				},
 			}},
 		}}},
 	}
@@ -298,8 +333,28 @@ func TestBuildChildJobNormalizesEveryControllerFieldToAtMostOnePod(t *testing.T)
 	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 || job.Spec.BackoffLimitPerIndex != nil || job.Spec.MaxFailedIndexes != nil {
 		t.Fatalf("retry fields were not cleared: %#v", job.Spec)
 	}
-	if job.Spec.Suspend == nil || *job.Spec.Suspend || job.Spec.ManagedBy != nil || job.Spec.CompletionMode != nil || job.Spec.PodFailurePolicy != nil || job.Spec.SuccessPolicy != nil || job.Spec.PodReplacementPolicy != nil {
-		t.Fatalf("controller fields were not normalized: %#v", job.Spec)
+	if job.Spec.Suspend == nil || *job.Spec.Suspend || job.Spec.ManagedBy != nil || job.Spec.CompletionMode != nil || job.Spec.PodFailurePolicy != nil || job.Spec.SuccessPolicy != nil || job.Spec.PodReplacementPolicy == nil || *job.Spec.PodReplacementPolicy != batchv1.Failed {
+		t.Fatalf("controller fields were not normalized safely: %#v", job.Spec)
+	}
+	if job.Spec.Selector != nil || job.Spec.ManualSelector != nil {
+		t.Fatalf("manual selector fields were retained: selector=%#v manual=%v", job.Spec.Selector, job.Spec.ManualSelector)
+	}
+	containers := append(append([]corev1.Container{}, job.Spec.Template.Spec.InitContainers...), job.Spec.Template.Spec.Containers...)
+	for _, container := range containers {
+		if container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 {
+			t.Fatalf("container %q retained restart overrides: policy=%v rules=%#v", container.Name, container.RestartPolicy, container.RestartPolicyRules)
+		}
+	}
+	if job.Spec.Template.Labels["custom"] != "preserved" {
+		t.Fatalf("unrelated Pod template label was not preserved: %#v", job.Spec.Template.Labels)
+	}
+	for _, reserved := range []string{batchv1.ControllerUidLabel, batchv1.JobNameLabel, "controller-uid", "job-name", "pod-template-hash", "batch.kubernetes.io/job-completion-index"} {
+		if _, found := job.Spec.Template.Labels[reserved]; found {
+			t.Fatalf("reserved Job controller label %q was retained: %#v", reserved, job.Spec.Template.Labels)
+		}
+	}
+	if _, found := job.Spec.Template.Annotations["batch.kubernetes.io/job-completion-index"]; found || job.Spec.Template.Annotations["custom"] != "preserved" {
+		t.Fatalf("reserved annotation was retained or custom annotation lost: %#v", job.Spec.Template.Annotations)
 	}
 	if job.Spec.Template.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		t.Fatalf("restartPolicy = %q", job.Spec.Template.Spec.RestartPolicy)

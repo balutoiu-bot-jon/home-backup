@@ -14,15 +14,21 @@ import (
 )
 
 type reconciledRun struct {
-	active    bool
-	unsafe    bool
-	resources []metav1.Object
-	jobs      []*batchv1.Job
-	secrets   []*corev1.Secret
-	pvcs      []*corev1.PersistentVolumeClaim
-	snapshots []*unstructured.Unstructured
-	contents  []*unstructured.Unstructured
+	active         bool
+	unsafe         bool
+	latestActivity time.Time
+	resources      []metav1.Object
+	jobs           []*batchv1.Job
+	secrets        []*corev1.Secret
+	pvcs           []*corev1.PersistentVolumeClaim
+	snapshots      []*unstructured.Unstructured
+	contents       []*unstructured.Unstructured
 }
+
+const (
+	staleJobCleanupTimeout      = time.Duration(ChildJobTerminationGraceSeconds)*time.Second + 15*time.Second
+	staleResourceCleanupTimeout = 2 * time.Minute
+)
 
 func ReconcileStaleRuns(ctx context.Context, clients *Clients, runnerNamespace string, sourceNamespaces []string, staleAfter time.Duration) error {
 	if clients == nil || clients.Core == nil || clients.Dynamic == nil {
@@ -65,6 +71,18 @@ func ReconcileStaleRuns(ctx context.Context, clients *Clients, runnerNamespace s
 		if run := add(job); run != nil {
 			run.jobs = append(run.jobs, job)
 			run.active = run.active || job.Status.Active > 0
+			for _, condition := range job.Status.Conditions {
+				if condition.Status != corev1.ConditionTrue || (condition.Type != batchv1.JobComplete && condition.Type != batchv1.JobFailed) {
+					continue
+				}
+				if condition.LastTransitionTime.IsZero() {
+					run.unsafe = true
+					continue
+				}
+				if condition.LastTransitionTime.Time.After(run.latestActivity) {
+					run.latestActivity = condition.LastTransitionTime.Time
+				}
+			}
 		}
 	}
 	secrets, err := clients.Core.CoreV1().Secrets(runnerNamespace).List(ctx, listOptions)
@@ -147,9 +165,20 @@ func ReconcileStaleRuns(ctx context.Context, clients *Clients, runnerNamespace s
 }
 
 func reconcileAbandonedRun(ctx context.Context, clients *Clients, runnerNamespace, runID string, run *reconciledRun) error {
+	return reconcileAbandonedRunWithTimeouts(ctx, clients, runnerNamespace, runID, run, staleJobCleanupTimeout, staleResourceCleanupTimeout)
+}
+
+func reconcileAbandonedRunWithTimeouts(ctx context.Context, clients *Clients, runnerNamespace, runID string, run *reconciledRun, jobTimeout, resourceTimeout time.Duration) error {
+	if jobTimeout <= 0 || resourceTimeout <= 0 {
+		return fmt.Errorf("positive stale Job and resource cleanup timeouts are required")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	parentCtx := ctx
+	jobCtx, cancelJobs := context.WithTimeout(parentCtx, jobTimeout)
+	defer cancelJobs()
+	ctx = jobCtx
 	runnerScope := RunnerScope(runnerNamespace)
 	sort.Slice(run.jobs, func(i, j int) bool {
 		return run.jobs[i].Namespace+"/"+run.jobs[i].Name < run.jobs[j].Namespace+"/"+run.jobs[j].Name
@@ -158,20 +187,14 @@ func reconcileAbandonedRun(ctx context.Context, clients *Clients, runnerNamespac
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		terminal := false
-		for _, condition := range job.Status.Conditions {
-			terminal = terminal || condition.Status == corev1.ConditionTrue && (condition.Type == batchv1.JobComplete || condition.Type == batchv1.JobFailed)
-		}
-		var err error
-		if terminal {
-			err = DeleteJobPodsIfOwned(ctx, clients, job.Namespace, job.Name, runID, runnerScope)
-		} else {
-			err = DeleteJobIfOwned(ctx, clients, job.Namespace, job.Name, runID, runnerScope)
-		}
-		if err != nil {
+		if err := DeleteJobIfOwned(ctx, clients, job.Namespace, job.Name, runID, runnerScope); err != nil {
 			return err
 		}
 	}
+	cancelJobs()
+	resourceCtx, cancelResources := context.WithTimeout(parentCtx, resourceTimeout)
+	defer cancelResources()
+	ctx = resourceCtx
 	sort.Slice(run.secrets, func(i, j int) bool {
 		return run.secrets[i].Namespace+"/"+run.secrets[i].Name < run.secrets[j].Namespace+"/"+run.secrets[j].Name
 	})
@@ -247,6 +270,9 @@ func aliasContentTargetsNamespace(content *unstructured.Unstructured, namespace 
 
 func runIsOlderThan(run *reconciledRun, cutoff time.Time) bool {
 	if len(run.resources) == 0 {
+		return false
+	}
+	if !run.latestActivity.IsZero() && !run.latestActivity.Before(cutoff) {
 		return false
 	}
 	for _, resource := range run.resources {

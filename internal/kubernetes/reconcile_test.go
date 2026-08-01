@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -151,13 +153,15 @@ func TestReconcileStaleRunsCleansAllocationsWithoutChildJob(t *testing.T) {
 	}
 }
 
-func TestReconcileStaleRunsDeletesTerminalPodsAndNonterminalJobsBeforeAllocations(t *testing.T) {
+func TestReconcileStaleRunsDeletesTerminalAndNonterminalJobsBeforeAllocations(t *testing.T) {
 	created := metav1.NewTime(time.Now().Add(-48 * time.Hour))
 	labels := map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "stale-run", RunnerScopeLabel: RunnerScope("backup")}
 	controller := true
 	terminal := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: "a-terminal", Namespace: "backup", UID: "terminal-uid", CreationTimestamp: created, Labels: labels},
-		Status:     batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: created,
+		}}},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "terminal-pod", Namespace: "backup", UID: "pod-uid", Labels: map[string]string{
@@ -180,12 +184,62 @@ func TestReconcileStaleRunsDeletesTerminalPodsAndNonterminalJobsBeforeAllocation
 	if err := ReconcileStaleRuns(context.Background(), &Clients{Core: coreClient, Dynamic: dynamicClient}, "backup", nil, 24*time.Hour); err != nil {
 		t.Fatalf("ReconcileStaleRuns() error = %v", err)
 	}
-	want := []string{"pods/terminal-pod", "jobs/b-running", "secrets/config"}
+	want := []string{"jobs/a-terminal", "jobs/b-running", "secrets/config"}
 	if !reflect.DeepEqual(deletes, want) {
 		t.Fatalf("deletes = %#v, want %#v", deletes, want)
 	}
-	if _, err := coreClient.BatchV1().Jobs("backup").Get(context.Background(), terminal.Name, metav1.GetOptions{}); err != nil {
-		t.Fatalf("terminal Job metadata was not retained: %v", err)
+	if _, err := coreClient.BatchV1().Jobs("backup").Get(context.Background(), terminal.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("terminal Job Get() error = %v, want NotFound", err)
+	}
+}
+
+func TestReconcileStaleRunsPreservesRecentlyTerminalRun(t *testing.T) {
+	created := metav1.NewTime(time.Now().Add(-48 * time.Hour))
+	recent := metav1.Now()
+	labels := map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "still-finishing", RunnerScopeLabel: RunnerScope("backup")}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "recently-terminal", Namespace: "backup", UID: "job-uid", CreationTimestamp: created, Labels: labels},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: recent,
+		}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "config", Namespace: "backup", UID: "secret-uid", CreationTimestamp: created, Labels: labels}}
+	coreClient := kubernetesfake.NewSimpleClientset(job, secret)
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+		VolumeSnapshotGVR: "VolumeSnapshotList", VolumeSnapshotContentGVR: "VolumeSnapshotContentList",
+	})
+
+	if err := ReconcileStaleRuns(context.Background(), &Clients{Core: coreClient, Dynamic: dynamicClient}, "backup", nil, 24*time.Hour); err != nil {
+		t.Fatalf("ReconcileStaleRuns() error = %v", err)
+	}
+	if _, err := coreClient.BatchV1().Jobs("backup").Get(context.Background(), job.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("recently terminal Job was deleted while its parent could still be collecting logs: %v", err)
+	}
+	if _, err := coreClient.CoreV1().Secrets("backup").Get(context.Background(), secret.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("recently terminal run dependency was deleted: %v", err)
+	}
+}
+
+func TestReconcileAbandonedRunBoundsForegroundJobDeletion(t *testing.T) {
+	labels := map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "stale", RunnerScopeLabel: RunnerScope("backup")}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "blocked", Namespace: "backup", UID: "job-uid", Labels: labels}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "config", Namespace: "backup", UID: "secret-uid", Labels: labels}}
+	coreClient := kubernetesfake.NewSimpleClientset(job, secret)
+	coreClient.PrependReactor("delete", "jobs", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, nil // Simulate a Job held by a Pod or finalizer.
+	})
+	run := &reconciledRun{jobs: []*batchv1.Job{job}, secrets: []*corev1.Secret{secret}}
+
+	started := time.Now()
+	err := reconcileAbandonedRunWithTimeouts(context.Background(), &Clients{Core: coreClient}, "backup", "stale", run, 20*time.Millisecond, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("reconcileAbandonedRunWithTimeouts() error = %v, want bounded deletion timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("blocked stale Job cleanup took %s", elapsed)
+	}
+	if _, getErr := coreClient.CoreV1().Secrets("backup").Get(context.Background(), secret.Name, metav1.GetOptions{}); getErr != nil {
+		t.Fatalf("dependent Secret was deleted after blocked Job deletion: %v", getErr)
 	}
 }
 

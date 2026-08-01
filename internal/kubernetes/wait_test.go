@@ -169,7 +169,18 @@ func TestDeleteJobIfOwned(t *testing.T) {
 		Labels: map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "run-1", RunnerScopeLabel: RunnerScope("backup")},
 	}}
 	coreClient := kubernetesfake.NewSimpleClientset(job)
-	coreClient.PrependReactor("delete", "jobs", assertDeleteUIDPrecondition(t, "job-uid"))
+	coreClient.PrependReactor("delete", "jobs", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		deleteAction := action.(clienttesting.DeleteAction)
+		options := deleteAction.GetDeleteOptions()
+		if options.PropagationPolicy == nil || *options.PropagationPolicy != metav1.DeletePropagationForeground {
+			t.Fatalf("Job propagation policy = %v, want Foreground", options.PropagationPolicy)
+		}
+		preconditions := options.Preconditions
+		if preconditions == nil || preconditions.UID == nil || *preconditions.UID != "job-uid" {
+			t.Fatalf("Job delete preconditions = %#v, want UID job-uid", preconditions)
+		}
+		return false, nil, nil
+	})
 	clients := &Clients{Core: coreClient}
 
 	if err := DeleteJobIfOwned(context.Background(), clients, "backup", "child", "run-1", RunnerScope("backup")); err != nil {
@@ -177,6 +188,27 @@ func TestDeleteJobIfOwned(t *testing.T) {
 	}
 	if _, err := clients.Core.BatchV1().Jobs("backup").Get(context.Background(), "child", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("deleted Job Get() error = %v", err)
+	}
+}
+
+func TestDeleteJobIfOwnedWaitsForForegroundDeletion(t *testing.T) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "child", Namespace: "backup", UID: "job-uid",
+		Labels: map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "run-1", RunnerScopeLabel: RunnerScope("backup")},
+	}}
+	coreClient := kubernetesfake.NewSimpleClientset(job)
+	coreClient.PrependReactor("delete", "jobs", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, nil // Simulate a Job held in foreground deletion by an owned Pod/finalizer.
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	err := DeleteJobIfOwned(ctx, &Clients{Core: coreClient}, "backup", "child", "run-1", RunnerScope("backup"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DeleteJobIfOwned() error = %v, want foreground deletion timeout", err)
+	}
+	if _, getErr := coreClient.BatchV1().Jobs("backup").Get(context.Background(), "child", metav1.GetOptions{}); getErr != nil {
+		t.Fatalf("Job did not remain while foreground deletion was blocked: %v", getErr)
 	}
 }
 
@@ -270,6 +302,40 @@ func TestJobPodLogsIfOwnedTimesOutStalledLogRequest(t *testing.T) {
 	}
 }
 
+func TestJobPodLogsIfOwnedHonorsCallerCancellation(t *testing.T) {
+	clients := ownedJobPodLogClients(t, func(ctx context.Context, _, _, _ string, _ corev1.PodLogOptions, _ int64) (string, bool, error) {
+		if ctx.Err() == nil {
+			return "", false, errors.New("caller cancellation was not propagated")
+		}
+		return "", false, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := jobPodLogsIfOwned(ctx, clients, "backup", "child", "run-1", ChildLogCollectionTimeout, ChildLogAggregateLimitBytes, ChildLogContainerLimitBytes)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("jobPodLogsIfOwned() error = %v, want caller cancellation", err)
+	}
+}
+
+func TestJobPodLogsIfOwnedReportsMidCollectionCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reads := 0
+	clients := ownedJobPodLogClients(t, func(context.Context, string, string, string, corev1.PodLogOptions, int64) (string, bool, error) {
+		reads++
+		cancel()
+		return "first container output", false, nil
+	})
+
+	logs, err := jobPodLogsIfOwned(ctx, clients, "backup", "child", "run-1", ChildLogCollectionTimeout, ChildLogAggregateLimitBytes, ChildLogContainerLimitBytes)
+	if !strings.Contains(logs, "first container output") || !errors.Is(err, context.Canceled) {
+		t.Fatalf("logs = %q, error = %v, want partial logs plus cancellation", logs, err)
+	}
+	if reads != 1 {
+		t.Fatalf("container log reads = %d, want 1 after cancellation", reads)
+	}
+}
+
 func ownedJobPodLogClients(t *testing.T, reader PodLogReader) *Clients {
 	t.Helper()
 	controller := true
@@ -293,40 +359,6 @@ func ownedJobPodLogClients(t *testing.T, reader PodLogReader) *Clients {
 		Status: corev1.PodStatus{Phase: corev1.PodFailed},
 	}
 	return &Clients{Core: kubernetesfake.NewSimpleClientset(job, pod), PodLogs: reader}
-}
-
-func TestDeleteJobPodsIfOwnedDeletesOnlyTerminalPodsControlledByJob(t *testing.T) {
-	controller := true
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
-		Name: "child", Namespace: "backup", UID: "job-uid",
-		Labels: map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "run-1", RunnerScopeLabel: RunnerScope("backup")},
-	}}
-	child := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "child-abc", Namespace: "backup", UID: "pod-uid",
-			Labels: map[string]string{batchv1.JobNameLabel: "child", ManagedByLabel: ManagedByLabelValue, RunLabel: "run-1", RunnerScopeLabel: RunnerScope("backup")},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "batch/v1", Kind: "Job", Name: "child", UID: "job-uid", Controller: &controller,
-			}},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
-	}
-	unrelated := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name: "unrelated", Namespace: "backup", Labels: map[string]string{batchv1.JobNameLabel: "another-job"},
-	}}
-	coreClient := kubernetesfake.NewSimpleClientset(job, child, unrelated)
-	coreClient.PrependReactor("delete", "pods", assertDeleteUIDPrecondition(t, "pod-uid"))
-	clients := &Clients{Core: coreClient}
-
-	if err := DeleteJobPodsIfOwned(context.Background(), clients, "backup", "child", "run-1", RunnerScope("backup")); err != nil {
-		t.Fatalf("DeleteJobPodsIfOwned() error = %v", err)
-	}
-	if _, err := clients.Core.CoreV1().Pods("backup").Get(context.Background(), child.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("deleted child Pod Get() error = %v", err)
-	}
-	if _, err := clients.Core.CoreV1().Pods("backup").Get(context.Background(), unrelated.Name, metav1.GetOptions{}); err != nil {
-		t.Fatalf("unrelated Pod Get() error = %v", err)
-	}
 }
 
 func TestDeleteSecretIfOwned(t *testing.T) {
@@ -492,36 +524,6 @@ func TestDeleteHelpersRejectCrossRunnerResourcesWithSameRunID(t *testing.T) {
 		if action.GetVerb() == "delete" {
 			t.Fatalf("foreign resource was deleted: %s/%s", action.GetResource().Resource, action.GetNamespace())
 		}
-	}
-}
-
-func TestDeleteJobPodsRejectsForeignScopePodUnderOwnedJob(t *testing.T) {
-	controller := true
-	expectedScope := RunnerScope("backup-a")
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
-		Name: "shared-job", Namespace: "backup-a", UID: "job-uid",
-		Labels: map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "shared-run", RunnerScopeLabel: expectedScope},
-	}}
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "shared-job-pod", Namespace: "backup-a", UID: "pod-uid",
-			Labels: map[string]string{
-				batchv1.JobNameLabel: job.Name, ManagedByLabel: ManagedByLabelValue,
-				RunLabel: "shared-run", RunnerScopeLabel: RunnerScope("backup-b"),
-			},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID, Controller: &controller,
-			}},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
-	}
-	coreClient := kubernetesfake.NewSimpleClientset(job, pod)
-	err := DeleteJobPodsIfOwned(context.Background(), &Clients{Core: coreClient}, "backup-a", job.Name, "shared-run", expectedScope)
-	if err == nil || !strings.Contains(err.Error(), "runner scope") {
-		t.Fatalf("DeleteJobPodsIfOwned() error = %v", err)
-	}
-	if _, getErr := coreClient.CoreV1().Pods("backup-a").Get(context.Background(), pod.Name, metav1.GetOptions{}); getErr != nil {
-		t.Fatalf("foreign Pod did not survive: %v", getErr)
 	}
 }
 

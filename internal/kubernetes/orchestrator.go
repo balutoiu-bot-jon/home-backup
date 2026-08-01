@@ -2,6 +2,8 @@ package kube
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -100,9 +102,28 @@ func (c *LonghornCluster) CreateChildConfigSecret(ctx context.Context, secret *c
 	return err
 }
 
+func (c *LonghornCluster) ValidateChildJob(ctx context.Context, job *batchv1.Job) error {
+	probe, err := c.clients.Core.BatchV1().Jobs(job.Namespace).Create(ctx, job.DeepCopy(), metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		return fmt.Errorf("dry-run child Job compatibility probe: %w", err)
+	}
+	if probe.Spec.PodReplacementPolicy == nil || *probe.Spec.PodReplacementPolicy != batchv1.Failed {
+		return errors.New("Kubernetes API did not preserve podReplacementPolicy=Failed; Longhorn child Jobs require Kubernetes 1.34 or a cluster with the JobPodReplacementPolicy feature enabled")
+	}
+	return nil
+}
+
 func (c *LonghornCluster) CreateChildJob(ctx context.Context, job *batchv1.Job) error {
-	_, err := c.clients.Core.BatchV1().Jobs(job.Namespace).Create(ctx, job, metav1.CreateOptions{})
-	return err
+	created, err := c.clients.Core.BatchV1().Jobs(job.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	if created.Spec.PodReplacementPolicy == nil || *created.Spec.PodReplacementPolicy != batchv1.Failed {
+		compatErr := errors.New("persisted child Job lost podReplacementPolicy=Failed; Kubernetes 1.34 or JobPodReplacementPolicy support is required")
+		deleteErr := DeleteJobIfOwned(ctx, c.clients, created.Namespace, created.Name, created.Labels[RunLabel], created.Labels[RunnerScopeLabel])
+		return errors.Join(compatErr, deleteErr)
+	}
+	return nil
 }
 
 func (c *LonghornCluster) WaitJobFinished(ctx context.Context, namespace, name string, timeout time.Duration) (bool, error) {
@@ -115,10 +136,6 @@ func (c *LonghornCluster) JobPodLogs(ctx context.Context, namespace, name, runID
 
 func (c *LonghornCluster) DeleteJob(ctx context.Context, namespace, name, runID, runnerScope string) error {
 	return DeleteJobIfOwned(ctx, c.clients, namespace, name, runID, runnerScope)
-}
-
-func (c *LonghornCluster) DeleteJobPods(ctx context.Context, namespace, name, runID, runnerScope string) error {
-	return DeleteJobPodsIfOwned(ctx, c.clients, namespace, name, runID, runnerScope)
 }
 
 func (c *LonghornCluster) DeleteSecret(ctx context.Context, namespace, name, runID, runnerScope string) error {

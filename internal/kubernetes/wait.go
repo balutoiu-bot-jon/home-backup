@@ -167,7 +167,7 @@ func jobPodLogsIfOwned(ctx context.Context, clients *Clients, namespace, name, r
 	if timeout <= 0 || aggregateLimit <= 0 || containerLimit <= 0 {
 		return "", errors.New("positive child log timeout and byte limits are required")
 	}
-	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	logCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	job, err := clients.Core.BatchV1().Jobs(namespace).Get(logCtx, name, metav1.GetOptions{})
 	if err != nil {
@@ -232,7 +232,8 @@ func jobPodLogsIfOwned(ctx context.Context, clients *Clients, namespace, name, r
 				readErrs = append(readErrs, fmt.Errorf("child backup Job logs truncated at aggregate limit of %d bytes", aggregateLimit))
 				collectionFull = true
 			}
-			if logCtx.Err() != nil {
+			if contextErr := logCtx.Err(); contextErr != nil {
+				readErrs = append(readErrs, fmt.Errorf("collect child backup Job logs: %w", contextErr))
 				collectionFull = true
 				break
 			}
@@ -242,53 +243,6 @@ func jobPodLogsIfOwned(ctx context.Context, clients *Clients, namespace, name, r
 		}
 	}
 	return output.String(), errors.Join(readErrs...)
-}
-
-func DeleteJobPodsIfOwned(ctx context.Context, clients *Clients, namespace, name, runID, runnerScope string) error {
-	job, err := clients.Core.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	resource := fmt.Sprintf("Job %s/%s", namespace, name)
-	if err := verifyRunnerOwnership(resource, job.Labels, runID, runnerScope); err != nil {
-		return err
-	}
-	pods, err := clients.Core.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", batchv1.JobNameLabel, name),
-	})
-	if err != nil {
-		return err
-	}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		podResource := fmt.Sprintf("Pod %s/%s", namespace, pod.Name)
-		if err := verifyRunnerOwnership(podResource, pod.Labels, runID, runnerScope); err != nil {
-			return err
-		}
-		owner, err := controllerOwner(pod.OwnerReferences, "Job")
-		if err != nil || owner.Name != job.Name || owner.UID != job.UID {
-			return fmt.Errorf("refusing to delete %s: Pod is not controlled by %s", podResource, resource)
-		}
-		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-			return fmt.Errorf("refusing to delete nonterminal %s in phase %s", podResource, pod.Status.Phase)
-		}
-		uid := pod.UID
-		if err := clients.Core.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid},
-		}); err != nil && !apierrors.IsNotFound(err) {
-			return err
-		}
-		if err := waitForDeletion(ctx, podResource, func(ctx context.Context) error {
-			_, err := clients.Core.CoreV1().Pods(namespace).Get(ctx, pod.Name, metav1.GetOptions{})
-			return err
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func DeleteSecretIfOwned(ctx context.Context, clients *Clients, namespace, name, runID, runnerScope string) error {
