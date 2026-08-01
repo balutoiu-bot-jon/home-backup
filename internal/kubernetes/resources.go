@@ -2,7 +2,10 @@ package kube
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"regexp"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,9 +18,43 @@ const (
 	VolumeSnapshotKind  = "VolumeSnapshot"
 	TempVolumeName      = "home-backup-snapshot"
 	RunLabel            = "home-backup.balutoiu.com/run"
+	RunnerScopeLabel    = "home-backup.balutoiu.com/runner-scope"
 	ManagedByLabel      = "app.kubernetes.io/managed-by"
 	ManagedByLabelValue = "home-backup"
 )
+
+var invalidLabelValueChars = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// RunnerScope returns a stable, collision-resistant DNS label value for one runner installation.
+func RunnerScope(runnerNamespace string) string {
+	sum := sha256.Sum256([]byte(runnerNamespace))
+	prefix := strings.Trim(invalidLabelValueChars.ReplaceAllString(strings.ToLower(runnerNamespace), "-"), "-")
+	if prefix == "" {
+		prefix = "runner"
+	}
+	const hashLength = 16
+	maxPrefixLength := 63 - 1 - hashLength
+	if len(prefix) > maxPrefixLength {
+		prefix = strings.TrimRight(prefix[:maxPrefixLength], "-")
+	}
+	return fmt.Sprintf("%s-%x", prefix, sum[:hashLength/2])
+}
+
+func managedLabels(runID, runnerScope string) map[string]string {
+	return map[string]string{
+		ManagedByLabel:   ManagedByLabelValue,
+		RunLabel:         runID,
+		RunnerScopeLabel: runnerScope,
+	}
+}
+
+func unstructuredManagedLabels(runID, runnerScope string) map[string]any {
+	return map[string]any{
+		ManagedByLabel:   ManagedByLabelValue,
+		RunLabel:         runID,
+		RunnerScopeLabel: runnerScope,
+	}
+}
 
 var VolumeSnapshotGVR = schema.GroupVersionResource{
 	Group: SnapshotAPIGroup, Version: "v1", Resource: "volumesnapshots",
@@ -26,13 +63,25 @@ var VolumeSnapshotContentGVR = schema.GroupVersionResource{
 	Group: SnapshotAPIGroup, Version: "v1", Resource: "volumesnapshotcontents",
 }
 
-func BuildVolumeSnapshot(name, namespace, pvcName, snapshotClass, runID string) *unstructured.Unstructured {
+func BuildChildConfigSecret(name, namespace, configBase64, runID, runnerScope string) *corev1.Secret {
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: namespace,
+			Labels: managedLabels(runID, runnerScope),
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{ChildConfigSecretKey: []byte(configBase64)},
+	}
+}
+
+func BuildVolumeSnapshot(name, namespace, pvcName, snapshotClass, runID, runnerScope string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": SnapshotAPIGroup + "/v1",
 		"kind":       VolumeSnapshotKind,
 		"metadata": map[string]any{
 			"name": name, "namespace": namespace,
-			"labels": map[string]any{ManagedByLabel: ManagedByLabelValue, RunLabel: runID},
+			"labels": unstructuredManagedLabels(runID, runnerScope),
 		},
 		"spec": map[string]any{
 			"volumeSnapshotClassName": snapshotClass,
@@ -41,7 +90,7 @@ func BuildVolumeSnapshot(name, namespace, pvcName, snapshotClass, runID string) 
 	}}
 }
 
-func BuildVolumeSnapshotAliasContent(contentName, snapshotName, namespace string, sourceContent *unstructured.Unstructured, runID string) (*unstructured.Unstructured, error) {
+func BuildVolumeSnapshotAliasContent(contentName, snapshotName, namespace string, sourceContent *unstructured.Unstructured, runID, runnerScope string) (*unstructured.Unstructured, error) {
 	if sourceContent == nil {
 		return nil, fmt.Errorf("source VolumeSnapshotContent is nil")
 	}
@@ -87,25 +136,25 @@ func BuildVolumeSnapshotAliasContent(contentName, snapshotName, namespace string
 		"kind":       "VolumeSnapshotContent",
 		"metadata": map[string]any{
 			"name":   contentName,
-			"labels": map[string]any{ManagedByLabel: ManagedByLabelValue, RunLabel: runID},
+			"labels": unstructuredManagedLabels(runID, runnerScope),
 		},
 		"spec": contentSpec,
 	}}, nil
 }
 
-func BuildPreprovisionedVolumeSnapshot(name, namespace, contentName, runID string) *unstructured.Unstructured {
+func BuildPreprovisionedVolumeSnapshot(name, namespace, contentName, runID, runnerScope string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": SnapshotAPIGroup + "/v1",
 		"kind":       VolumeSnapshotKind,
 		"metadata": map[string]any{
 			"name": name, "namespace": namespace,
-			"labels": map[string]any{ManagedByLabel: ManagedByLabelValue, RunLabel: runID},
+			"labels": unstructuredManagedLabels(runID, runnerScope),
 		},
 		"spec": map[string]any{"source": map[string]any{"volumeSnapshotContentName": contentName}},
 	}}
 }
 
-func BuildRestorePVC(name, namespace string, sourcePVC *corev1.PersistentVolumeClaim, snapshotName, storageClassOverride, runID string) (*corev1.PersistentVolumeClaim, error) {
+func BuildRestorePVC(name, namespace string, sourcePVC *corev1.PersistentVolumeClaim, snapshotName, storageClassOverride, runID, runnerScope string) (*corev1.PersistentVolumeClaim, error) {
 	if sourcePVC == nil {
 		return nil, fmt.Errorf("source PVC is nil")
 	}
@@ -128,7 +177,7 @@ func BuildRestorePVC(name, namespace string, sourcePVC *corev1.PersistentVolumeC
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name, Namespace: namespace,
-			Labels: map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: runID},
+			Labels: managedLabels(runID, runnerScope),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: sourcePVC.Spec.AccessModes, StorageClassName: storageClassName,

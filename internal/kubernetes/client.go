@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -26,7 +28,10 @@ const (
 type Clients struct {
 	Core    kubernetes.Interface
 	Dynamic dynamic.Interface
+	PodLogs PodLogReader
 }
+
+type PodLogReader func(context.Context, string, string, string, corev1.PodLogOptions, int64) (string, bool, error)
 
 func NewClients() (*Clients, error) {
 	cfg, err := loadRESTConfig(rest.InClusterConfig, kubeconfig)
@@ -41,7 +46,25 @@ func NewClients() (*Clients, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating Kubernetes dynamic client: %w", err)
 	}
-	return &Clients{Core: core, Dynamic: dyn}, nil
+	return &Clients{
+		Core: core, Dynamic: dyn,
+		PodLogs: func(ctx context.Context, namespace, pod, container string, options corev1.PodLogOptions, maxBytes int64) (string, bool, error) {
+			options.Container = container
+			requestLimit := maxBytes + 1
+			options.LimitBytes = &requestLimit
+			stream, err := core.CoreV1().Pods(namespace).GetLogs(pod, &options).Stream(ctx)
+			if err != nil {
+				return "", false, err
+			}
+			data, readErr := io.ReadAll(io.LimitReader(stream, maxBytes+1))
+			closeErr := stream.Close()
+			truncated := int64(len(data)) > maxBytes
+			if truncated {
+				data = data[:maxBytes]
+			}
+			return string(data), truncated, errors.Join(readErr, closeErr)
+		},
+	}, nil
 }
 
 type restConfigLoader func() (*rest.Config, error)
@@ -115,6 +138,9 @@ func ResolveCronJob(ctx context.Context, clients *Clients, namespace string) (*b
 	if err != nil {
 		return nil, fmt.Errorf("getting Job %s/%s: %w", namespace, jobOwner.Name, err)
 	}
+	if jobOwner.UID != job.UID {
+		return nil, fmt.Errorf("Job %s/%s UID %q does not match Pod owner UID %q", namespace, job.Name, job.UID, jobOwner.UID)
+	}
 	cronJobOwner, err := controllerOwner(job.OwnerReferences, "CronJob")
 	if err != nil {
 		return nil, fmt.Errorf("detecting CronJob for Job %s/%s: %w", namespace, job.Name, err)
@@ -123,16 +149,19 @@ func ResolveCronJob(ctx context.Context, clients *Clients, namespace string) (*b
 	if err != nil {
 		return nil, fmt.Errorf("getting CronJob %s/%s: %w", namespace, cronJobOwner.Name, err)
 	}
+	if cronJobOwner.UID != cronJob.UID {
+		return nil, fmt.Errorf("CronJob %s/%s UID %q does not match Job owner UID %q", namespace, cronJob.Name, cronJob.UID, cronJobOwner.UID)
+	}
 	return cronJob, nil
 }
 
 func controllerOwner(owners []metav1.OwnerReference, kind string) (*metav1.OwnerReference, error) {
 	for i := range owners {
-		if owners[i].Kind == kind && owners[i].Controller != nil && *owners[i].Controller {
+		if owners[i].APIVersion == "batch/v1" && owners[i].Kind == kind && owners[i].Controller != nil && *owners[i].Controller {
 			return &owners[i], nil
 		}
 	}
-	return nil, fmt.Errorf("no controlling %s owner reference", kind)
+	return nil, fmt.Errorf("no controlling batch/v1 %s owner reference", kind)
 }
 
 func kubeconfig() (*rest.Config, error) {

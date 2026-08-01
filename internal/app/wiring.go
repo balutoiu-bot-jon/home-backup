@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/ionutbalutoiu/home-backup/internal/backup"
 	"github.com/ionutbalutoiu/home-backup/internal/command"
@@ -26,7 +27,7 @@ type wiringDependencies struct {
 	longhornJob longhornJobBuilder
 }
 
-func newLonghornJobBuilder() longhornJobBuilder {
+func newLonghornJobBuilder(logger *slog.Logger) longhornJobBuilder {
 	var cluster longhorn.Cluster
 	var runnerNamespace string
 	return func(source config.LonghornPVCSource, destination config.ResticDestination) (backup.Job, error) {
@@ -49,7 +50,7 @@ func newLonghornJobBuilder() longhornJobBuilder {
 			Timeout: source.Timeout,
 		}, longhorn.ResticDestination{
 			Repo: destination.Repo, KeepLast: destination.KeepLast, GroupBy: destination.GroupBy,
-		}, cluster, runnerNamespace)
+		}, cluster, runnerNamespace, longhorn.WithLogger(logger))
 	}
 }
 
@@ -59,6 +60,12 @@ func buildJobs(cfg config.Config, deps wiringDependencies) ([]backup.Job, error)
 		if spec.Source.Kind == config.SourceLonghornPVC {
 			if spec.Destination.Kind != config.DestinationRestic {
 				return nil, fmt.Errorf("build backup %d destination: unsupported destination kind %q", i+1, spec.Destination.Kind)
+			}
+			if spec.Destination.Restic == nil {
+				return nil, fmt.Errorf("build backup %d destination: Restic destination is required", i+1)
+			}
+			if err := longhorn.ValidateResticGroupBy(spec.Destination.Restic.GroupBy); err != nil {
+				return nil, fmt.Errorf("build backup %d Longhorn destination: %w", i+1, err)
 			}
 			if deps.longhornJob == nil {
 				return nil, fmt.Errorf("build backup %d source: Longhorn job builder is unavailable", i+1)

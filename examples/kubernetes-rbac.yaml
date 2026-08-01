@@ -13,13 +13,22 @@ rules:
       - pods
     verbs:
       - get
+      - list
+      - delete
+  - apiGroups: [""]
+    resources:
+      - pods/log
+    verbs:
+      - get
   - apiGroups: [""]
     resources:
       - persistentvolumeclaims
+      - secrets
     verbs:
       - get
       - create
       - delete
+      - list
   - apiGroups:
       - batch
     resources:
@@ -34,6 +43,7 @@ rules:
       - get
       - create
       - delete
+      - list
   - apiGroups:
       - snapshot.storage.k8s.io
     resources:
@@ -42,7 +52,13 @@ rules:
       - get
       - create
       - delete
+      - list
 ---
+# The RoleBinding grants the parent runner broad lifecycle permissions. Copied
+# child Jobs retain this ServiceAccount name for image-pull and identity metadata,
+# but home-backup disables token automount and strips inherited projected API
+# tokens/mounts from every child container, so the backup workload cannot use
+# these Kubernetes API permissions.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
@@ -76,6 +92,7 @@ rules:
       - get
       - create
       - delete
+      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -92,7 +109,9 @@ roleRef:
   name: home-backup-longhorn-source
 ---
 # VolumeSnapshotContent is cluster-scoped. The alias uses deletionPolicy Retain
-# and is deleted explicitly after the restored PVC is removed.
+# and is deleted explicitly after the restored PVC is removed. Cluster-wide list
+# is required by stale-run reconciliation, which filters and validates the
+# durable runner-scope label plus the alias volumeSnapshotRef namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -106,6 +125,7 @@ rules:
       - get
       - create
       - delete
+      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

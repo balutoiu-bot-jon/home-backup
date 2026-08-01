@@ -24,17 +24,19 @@ type options struct {
 }
 
 type runtimeDependencies struct {
-	newRunner func(*slog.Logger) commandRunner
-	euid      func() int
-	lookupEnv func(string) (string, bool)
+	newRunner             func(*slog.Logger) commandRunner
+	euid                  func() int
+	lookupEnv             func(string) (string, bool)
+	newLonghornJobBuilder func(*slog.Logger) longhornJobBuilder
 }
 
 // Run parses application arguments and executes all configured backups.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return run(ctx, args, stdout, stderr, runtimeDependencies{
-		newRunner: func(logger *slog.Logger) commandRunner { return command.NewRunner(logger) },
-		euid:      os.Geteuid,
-		lookupEnv: os.LookupEnv,
+		newRunner:             func(logger *slog.Logger) commandRunner { return command.NewRunner(logger) },
+		euid:                  os.Geteuid,
+		lookupEnv:             os.LookupEnv,
+		newLonghornJobBuilder: newLonghornJobBuilder,
 	})
 }
 
@@ -49,8 +51,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, deps runt
 		return err
 	}
 	runner := deps.newRunner(logger)
+	longhornBuilderFactory := deps.newLonghornJobBuilder
+	if longhornBuilderFactory == nil {
+		longhornBuilderFactory = newLonghornJobBuilder
+	}
 	jobs, err := buildJobs(cfg, wiringDependencies{
-		runner: runner, euid: deps.euid, longhornJob: newLonghornJobBuilder(),
+		runner: runner, euid: deps.euid, longhornJob: longhornBuilderFactory(logger),
 	})
 	if err != nil {
 		return err

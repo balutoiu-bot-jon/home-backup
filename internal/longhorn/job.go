@@ -4,10 +4,13 @@ package longhorn
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -19,7 +22,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-const cleanupTimeout = 2 * time.Minute
+const (
+	cleanupTimeout = 2 * time.Minute
+	staleRunAge    = 24 * time.Hour
+)
 
 // Config describes the source PVC and child Job settings.
 type Config struct {
@@ -41,6 +47,7 @@ type ResticDestination struct {
 
 // Cluster is the semantic Kubernetes boundary used by Job.
 type Cluster interface {
+	ReconcileStaleRuns(context.Context, string, []string, time.Duration) error
 	ResolveCronJob(context.Context, string) (*batchv1.CronJob, error)
 	GetPVC(context.Context, string, string) (*corev1.PersistentVolumeClaim, error)
 	CreateSnapshot(context.Context, homekube.SnapshotSpec) error
@@ -48,12 +55,16 @@ type Cluster interface {
 	CreateSnapshotAliasContent(context.Context, homekube.SnapshotAliasSpec) error
 	CreateSnapshotAlias(context.Context, homekube.SnapshotAliasSpec) error
 	CreateRestoredPVC(context.Context, homekube.RestorePVCOptions) error
+	CreateChildConfigSecret(context.Context, *corev1.Secret) error
 	CreateChildJob(context.Context, *batchv1.Job) error
 	WaitJobFinished(context.Context, string, string, time.Duration) (bool, error)
-	DeleteJob(context.Context, string, string, string) error
-	DeletePVC(context.Context, string, string, string) error
-	DeleteSnapshot(context.Context, string, string, string) error
-	DeleteSnapshotContent(context.Context, string, string) error
+	JobPodLogs(context.Context, string, string, string) (string, error)
+	DeleteJob(context.Context, string, string, string, string) error
+	DeleteJobPods(context.Context, string, string, string, string) error
+	DeleteSecret(context.Context, string, string, string, string) error
+	DeletePVC(context.Context, string, string, string, string) error
+	DeleteSnapshot(context.Context, string, string, string, string) error
+	DeleteSnapshotContent(context.Context, string, string, string, string) error
 }
 
 // Job snapshots a PVC, restores it beside the orchestrator, and starts a copy of the orchestrator CronJob.
@@ -64,10 +75,23 @@ type Job struct {
 	runnerNamespace string
 	resourceName    func(string) (string, error)
 	cleanupTimeout  time.Duration
+	logger          *slog.Logger
+}
+
+// Option configures optional Longhorn Job behavior.
+type Option func(*Job)
+
+// WithLogger routes lifecycle diagnostics through the application's configured logger.
+func WithLogger(logger *slog.Logger) Option {
+	return func(job *Job) {
+		if logger != nil {
+			job.logger = logger
+		}
+	}
 }
 
 // NewJob constructs a Longhorn PVC backup job.
-func NewJob(config Config, destination ResticDestination, cluster Cluster, runnerNamespace string) (*Job, error) {
+func NewJob(config Config, destination ResticDestination, cluster Cluster, runnerNamespace string, options ...Option) (*Job, error) {
 	if cluster == nil {
 		return nil, errors.New("Longhorn cluster is required")
 	}
@@ -80,14 +104,34 @@ func NewJob(config Config, destination ResticDestination, cluster Cluster, runne
 	if destination.Repo == "" {
 		return nil, errors.New("Restic repository is required")
 	}
-	return &Job{
+	if err := ValidateResticGroupBy(destination.GroupBy); err != nil {
+		return nil, err
+	}
+	job := &Job{
 		config:          config,
 		destination:     destination,
 		cluster:         cluster,
 		runnerNamespace: runnerNamespace,
 		resourceName:    temporaryResourceName,
 		cleanupTimeout:  cleanupTimeout,
-	}, nil
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	for _, option := range options {
+		if option != nil {
+			option(job)
+		}
+	}
+	return job, nil
+}
+
+// ValidateResticGroupBy ensures Longhorn retention remains isolated by the stable source host.
+func ValidateResticGroupBy(groupBy string) error {
+	for _, group := range strings.Split(groupBy, ",") {
+		if strings.TrimSpace(group) == "host" {
+			return nil
+		}
+	}
+	return fmt.Errorf("longhorn_pvc Restic group_by must include %q (for example %q or %q) to isolate retention by source; got %q", "host", "host", "host,paths", groupBy)
 }
 
 // Run executes one complete snapshot, restore, child backup, and cleanup lifecycle.
@@ -95,6 +139,10 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 	sourceNamespace := j.config.Namespace
 	if sourceNamespace == "" {
 		sourceNamespace = j.runnerNamespace
+	}
+	runnerScope := homekube.RunnerScope(j.runnerNamespace)
+	if err := j.cluster.ReconcileStaleRuns(ctx, j.runnerNamespace, []string{sourceNamespace}, staleRunAge); err != nil {
+		return fmt.Errorf("reconcile stale Longhorn backup runs: %w", err)
 	}
 
 	cronJob, err := j.cluster.ResolveCronJob(ctx, j.runnerNamespace)
@@ -113,6 +161,7 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 	aliasContentName := resourceNameWithSuffix(baseName, "alias-content")
 	aliasSnapshotName := resourceNameWithSuffix(baseName, "alias-snap")
 	tempPVCName := resourceNameWithSuffix(baseName, "pvc")
+	childConfigSecretName := resourceNameWithSuffix(baseName, "config")
 	childJobName := resourceNameWithSuffix(baseName, "job")
 
 	restoreSnapshotName := sourceSnapshotName
@@ -125,22 +174,25 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 	}
 	restorePVCOptions := homekube.RestorePVCOptions{
 		Name: tempPVCName, Namespace: j.runnerNamespace, SourcePVC: sourcePVC,
-		SnapshotName: restoreSnapshotName, StorageClassOverride: j.config.StorageClass, RunID: baseName,
+		SnapshotName: restoreSnapshotName, StorageClassOverride: j.config.StorageClass, RunID: baseName, RunnerScope: runnerScope,
 	}
 	if _, err := homekube.BuildRestorePVC(
 		restorePVCOptions.Name, restorePVCOptions.Namespace, restorePVCOptions.SourcePVC,
-		restorePVCOptions.SnapshotName, restorePVCOptions.StorageClassOverride, restorePVCOptions.RunID,
+		restorePVCOptions.SnapshotName, restorePVCOptions.StorageClassOverride, restorePVCOptions.RunID, restorePVCOptions.RunnerScope,
 	); err != nil {
 		return fmt.Errorf("validate restored PVC: %w", err)
 	}
 	childJobOptions := homekube.ChildJobOptions{
 		Name: childJobName, RunID: baseName, CronJob: cronJob, ContainerName: j.config.ContainerName,
-		TempPVCName: tempPVCName, MountPath: j.config.MountPath, ChildConfigBase64: childConfig,
+		TempPVCName: tempPVCName, MountPath: j.config.MountPath, ChildConfigSecretName: childConfigSecretName,
+		ResticHost:  resticHostIdentity(sourceNamespace, j.config.PVCName),
+		RunnerScope: runnerScope,
 	}
 	childJob, err := homekube.BuildChildJob(childJobOptions)
 	if err != nil {
 		return fmt.Errorf("validate child Job: %w", err)
 	}
+	childConfigSecret := homekube.BuildChildConfigSecret(childConfigSecretName, j.runnerNamespace, childConfig, baseName, runnerScope)
 
 	boundedCleanup := j.cleanupTimeout
 	if boundedCleanup <= 0 {
@@ -154,11 +206,11 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 	}()
 
 	cleanup = append(cleanup, func(ctx context.Context) error {
-		return j.cluster.DeleteSnapshot(ctx, sourceNamespace, sourceSnapshotName, baseName)
+		return j.cluster.DeleteSnapshot(ctx, sourceNamespace, sourceSnapshotName, baseName, runnerScope)
 	})
 	if err := j.cluster.CreateSnapshot(ctx, homekube.SnapshotSpec{
 		Name: sourceSnapshotName, Namespace: sourceNamespace,
-		PVCName: j.config.PVCName, SnapshotClass: j.config.SnapshotClass, RunID: baseName,
+		PVCName: j.config.PVCName, SnapshotClass: j.config.SnapshotClass, RunID: baseName, RunnerScope: runnerScope,
 	}); err != nil {
 		return fmt.Errorf("create source VolumeSnapshot %s/%s: %w", sourceNamespace, sourceSnapshotName, err)
 	}
@@ -171,15 +223,16 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 			SourceNamespace: sourceNamespace, SourceSnapshotName: sourceSnapshotName,
 			TargetNamespace: j.runnerNamespace, TargetSnapshotName: aliasSnapshotName,
 			AliasContentName: aliasContentName, RunID: baseName,
+			RunnerScope: runnerScope,
 		}
 		cleanup = append(cleanup, func(ctx context.Context) error {
-			return j.cluster.DeleteSnapshotContent(ctx, aliasContentName, baseName)
+			return j.cluster.DeleteSnapshotContent(ctx, aliasContentName, baseName, runnerScope, j.runnerNamespace)
 		})
 		if err := j.cluster.CreateSnapshotAliasContent(ctx, aliasSpec); err != nil {
 			return fmt.Errorf("create VolumeSnapshotContent alias %s: %w", aliasContentName, err)
 		}
 		cleanup = append(cleanup, func(ctx context.Context) error {
-			return j.cluster.DeleteSnapshot(ctx, j.runnerNamespace, aliasSnapshotName, baseName)
+			return j.cluster.DeleteSnapshot(ctx, j.runnerNamespace, aliasSnapshotName, baseName, runnerScope)
 		})
 		if err := j.cluster.CreateSnapshotAlias(ctx, aliasSpec); err != nil {
 			return fmt.Errorf("create target VolumeSnapshot alias %s/%s: %w", j.runnerNamespace, aliasSnapshotName, err)
@@ -190,22 +243,54 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 	}
 
 	cleanup = append(cleanup, func(ctx context.Context) error {
-		return j.cluster.DeletePVC(ctx, j.runnerNamespace, tempPVCName, baseName)
+		return j.cluster.DeletePVC(ctx, j.runnerNamespace, tempPVCName, baseName, runnerScope)
 	})
 	if err := j.cluster.CreateRestoredPVC(ctx, restorePVCOptions); err != nil {
 		return fmt.Errorf("create temporary PVC %s/%s: %w", j.runnerNamespace, tempPVCName, err)
+	}
+	cleanup = append(cleanup, func(ctx context.Context) error {
+		return j.cluster.DeleteSecret(ctx, j.runnerNamespace, childConfigSecretName, baseName, runnerScope)
+	})
+	if err := j.cluster.CreateChildConfigSecret(ctx, childConfigSecret); err != nil {
+		return fmt.Errorf("create child config Secret %s/%s: %w", j.runnerNamespace, childConfigSecretName, err)
 	}
 	jobTerminal := false
 	cleanup = append(cleanup, func(ctx context.Context) error {
 		if jobTerminal {
 			return nil
 		}
-		return j.cluster.DeleteJob(ctx, j.runnerNamespace, childJobName, baseName)
+		return j.cluster.DeleteJob(ctx, j.runnerNamespace, childJobName, baseName, runnerScope)
+	})
+	cleanup = append(cleanup, func(ctx context.Context) error {
+		if !jobTerminal {
+			return nil
+		}
+		return j.cluster.DeleteJobPods(ctx, j.runnerNamespace, childJobName, baseName, runnerScope)
 	})
 	if err := j.cluster.CreateChildJob(ctx, childJob); err != nil {
 		return fmt.Errorf("create child backup Job %s/%s: %w", j.runnerNamespace, childJobName, err)
 	}
 	jobTerminal, err = j.cluster.WaitJobFinished(ctx, j.runnerNamespace, childJobName, j.config.Timeout)
+	if jobTerminal {
+		logs, logsErr := j.cluster.JobPodLogs(ctx, j.runnerNamespace, childJobName, baseName)
+		if err != nil {
+			waitErr := fmt.Errorf("wait for child backup Job %s/%s: %w", j.runnerNamespace, childJobName, err)
+			if logsErr != nil {
+				combinedErr := errors.Join(waitErr, fmt.Errorf("collect child backup Job logs: %w", logsErr))
+				if logs != "" {
+					return fmt.Errorf("%w\nchild backup Job logs:\n%s", combinedErr, logs)
+				}
+				return combinedErr
+			}
+			return fmt.Errorf("%w\nchild backup Job logs:\n%s", waitErr, logs)
+		}
+		if logs != "" {
+			j.logger.Debug("child backup Job logs", "namespace", j.runnerNamespace, "job", childJobName, "logs", logs)
+		}
+		if logsErr != nil {
+			j.logger.Warn("failed to collect all completed child backup Job logs", "namespace", j.runnerNamespace, "job", childJobName, "error", logsErr)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("wait for child backup Job %s/%s: %w", j.runnerNamespace, childJobName, err)
 	}
@@ -256,6 +341,21 @@ func buildChildConfigBase64(mountPath string, destination ResticDestination) (st
 }
 
 var invalidDNS1123Chars = regexp.MustCompile(`[^a-z0-9-]+`)
+
+func resticHostIdentity(namespace, pvcName string) string {
+	sum := sha256.Sum256([]byte(namespace + "\x00" + pvcName))
+	prefix := strings.Trim(invalidDNS1123Chars.ReplaceAllString(strings.ToLower(namespace+"-"+pvcName), "-"), "-")
+	if prefix == "" {
+		prefix = "pvc"
+	}
+	const hashLength = 16
+	const base = "home-backup-"
+	maxPrefixLength := 63 - len(base) - 1 - hashLength
+	if len(prefix) > maxPrefixLength {
+		prefix = strings.TrimRight(prefix[:maxPrefixLength], "-")
+	}
+	return fmt.Sprintf("%s%s-%x", base, prefix, sum[:hashLength/2])
+}
 
 func temporaryResourceName(pvcName string) (string, error) {
 	suffix := make([]byte, 12)
