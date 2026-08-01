@@ -30,7 +30,7 @@ backups:
   # Secret-backed HOME_BACKUP_CONFIG_B64 override.
   # The selected child container gets a stable source-specific RESTIC_HOST.
   # Set the parent CronJob Job template terminationGracePeriodSeconds to at
-  # least 180; home-backup fails before snapshot creation otherwise.
+  # least 300; home-backup fails before snapshot creation otherwise.
   # Bounded terminal Pod logs are captured before the Pod is deleted for PVC cleanup;
   # the completed or failed child Job metadata is deleted after three days.
   # Abandoned labeled resources older than 24 hours are swept before a new run.

@@ -13,8 +13,8 @@ import (
 
 const (
 	ChildJobTTLSeconds              int32 = 3 * 24 * 60 * 60
-	ChildJobTerminationGraceSeconds int64 = 30
-	ParentMinimumGraceSeconds       int64 = 180
+	ChildJobTerminationGraceSeconds int64 = 150
+	ParentMinimumGraceSeconds       int64 = 300
 	ChildConfigSecretKey                  = "config-b64"
 )
 
@@ -43,7 +43,7 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 	}
 	parentGrace := opts.CronJob.Spec.JobTemplate.Spec.Template.Spec.TerminationGracePeriodSeconds
 	if parentGrace == nil || *parentGrace < ParentMinimumGraceSeconds {
-		return nil, fmt.Errorf("parent CronJob Job template terminationGracePeriodSeconds must be at least %d seconds (120-second cleanup, 30-second child shutdown, and 30-second margin)", ParentMinimumGraceSeconds)
+		return nil, fmt.Errorf("parent CronJob Job template terminationGracePeriodSeconds must be at least %d seconds (120-second cleanup, 150-second child shutdown, and 30-second margin)", ParentMinimumGraceSeconds)
 	}
 
 	jobSpec := *opts.CronJob.Spec.JobTemplate.Spec.DeepCopy()

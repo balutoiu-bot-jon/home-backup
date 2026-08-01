@@ -307,7 +307,7 @@ func TestBuildChildJobNormalizesEveryControllerFieldToAtMostOnePod(t *testing.T)
 }
 
 func TestBuildChildJobRejectsParentTerminationGraceBelowCleanupContract(t *testing.T) {
-	tooShort := int64(179)
+	tooShort := int64(299)
 	for _, test := range []struct {
 		name  string
 		grace *int64
@@ -330,7 +330,7 @@ func TestBuildChildJobRejectsParentTerminationGraceBelowCleanupContract(t *testi
 				TempPVCName: "restored", MountPath: "/backup-source", ChildConfigSecretName: "child-config",
 				ResticHost: "home-backup-source-data-0123456789abcdef",
 			})
-			if err == nil || !strings.Contains(err.Error(), "terminationGracePeriodSeconds") || !strings.Contains(err.Error(), "180") {
+			if err == nil || !strings.Contains(err.Error(), "terminationGracePeriodSeconds") || !strings.Contains(err.Error(), "300") {
 				t.Fatalf("BuildChildJob() error = %v", err)
 			}
 		})
