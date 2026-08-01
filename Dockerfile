@@ -1,7 +1,7 @@
 FROM golang:1.26.5-alpine AS build
 
 # renovate: datasource=github-releases depName=rclone packageName=rclone/rclone
-ARG RCLONE_VERSION="1.74.4"
+ARG RCLONE_VERSION="1.75.0"
 # renovate: datasource=github-releases depName=restic packageName=restic/restic
 ARG RESTIC_VERSION="0.19.1"
 
