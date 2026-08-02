@@ -2,8 +2,10 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -62,8 +64,12 @@ func TestValidateThenCreateChildJobUsesDryRunOnlyForProbe(t *testing.T) {
 	if err := cluster.ValidateChildJob(context.Background(), job); err != nil {
 		t.Fatalf("ValidateChildJob() error = %v", err)
 	}
-	if err := cluster.CreateChildJob(context.Background(), job); err != nil {
+	cleanupSafe, err := cluster.CreateChildJob(context.Background(), job)
+	if err != nil {
 		t.Fatalf("CreateChildJob() error = %v", err)
+	}
+	if !cleanupSafe {
+		t.Fatal("CreateChildJob() reported that dependency cleanup was unsafe after a successful create")
 	}
 	if createCalls != 2 {
 		t.Fatalf("create calls = %d, want dry-run probe plus persisted create", createCalls)
@@ -88,11 +94,96 @@ func TestCreateChildJobDeletesPersistedJobIfActualResponseDropsReplacementPolicy
 		return true, dropped, nil
 	})
 
-	err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(context.Background(), job)
+	cleanupSafe, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(context.Background(), job)
 	if err == nil || !strings.Contains(err.Error(), "persisted child Job lost podReplacementPolicy") {
 		t.Fatalf("CreateChildJob() error = %v, want persisted compatibility error", err)
 	}
+	if !cleanupSafe {
+		t.Fatal("CreateChildJob() reported that dependency cleanup was unsafe after deleting the incompatible Job")
+	}
 	if _, getErr := coreClient.BatchV1().Jobs(job.Namespace).Get(context.Background(), job.Name, metav1.GetOptions{}); !apierrors.IsNotFound(getErr) {
 		t.Fatalf("incompatible persisted Job Get() error = %v, want NotFound after foreground deletion", getErr)
+	}
+}
+
+func TestRollbackChildJobUsesFreshBoundedContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := rollbackChildJob(ctx, func(rollbackCtx context.Context) error {
+		if rollbackCtx.Err() != nil {
+			t.Fatalf("rollback context error = %v", rollbackCtx.Err())
+		}
+		deadline, ok := rollbackCtx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > ChildJobDeletionTimeout {
+			t.Fatalf("rollback deadline = %v, present = %v", deadline, ok)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("rollbackChildJob() error = %v", err)
+	}
+}
+
+func TestCreateChildJobRollsBackWithFreshContextAfterCancellation(t *testing.T) {
+	policy := batchv1.Failed
+	runnerScope := RunnerScope("backup")
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "child", Namespace: "backup",
+		Labels: map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "run-1", RunnerScopeLabel: runnerScope},
+	}, Spec: batchv1.JobSpec{PodReplacementPolicy: &policy}}
+	coreClient := kubernetesfake.NewSimpleClientset()
+	ctx, cancel := context.WithCancel(context.Background())
+	coreClient.PrependReactor("create", "jobs", func(clienttesting.Action) (bool, runtime.Object, error) {
+		dropped := job.DeepCopy()
+		dropped.UID = "job-uid"
+		dropped.Spec.PodReplacementPolicy = nil
+		if err := coreClient.Tracker().Create(batchv1.SchemeGroupVersion.WithResource("jobs"), dropped, dropped.Namespace); err != nil {
+			t.Fatalf("tracker Create() error = %v", err)
+		}
+		cancel()
+		return true, dropped, nil
+	})
+
+	cleanupSafe, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(ctx, job)
+	if err == nil || !strings.Contains(err.Error(), "persisted child Job lost podReplacementPolicy") {
+		t.Fatalf("CreateChildJob() error = %v, want persisted compatibility error", err)
+	}
+	if !cleanupSafe {
+		t.Fatal("CreateChildJob() reported unsafe dependency cleanup after cancellation-independent rollback")
+	}
+	if _, getErr := coreClient.BatchV1().Jobs(job.Namespace).Get(context.Background(), job.Name, metav1.GetOptions{}); !apierrors.IsNotFound(getErr) {
+		t.Fatalf("incompatible persisted Job Get() error = %v, want NotFound after rollback", getErr)
+	}
+}
+
+func TestCreateChildJobReportsUnsafeDependencyCleanupWhenRollbackFails(t *testing.T) {
+	policy := batchv1.Failed
+	runnerScope := RunnerScope("backup")
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "child", Namespace: "backup",
+		Labels: map[string]string{ManagedByLabel: ManagedByLabelValue, RunLabel: "run-1", RunnerScopeLabel: runnerScope},
+	}, Spec: batchv1.JobSpec{PodReplacementPolicy: &policy}}
+	coreClient := kubernetesfake.NewSimpleClientset()
+	coreClient.PrependReactor("create", "jobs", func(clienttesting.Action) (bool, runtime.Object, error) {
+		dropped := job.DeepCopy()
+		dropped.UID = "job-uid"
+		dropped.Spec.PodReplacementPolicy = nil
+		if err := coreClient.Tracker().Create(batchv1.SchemeGroupVersion.WithResource("jobs"), dropped, dropped.Namespace); err != nil {
+			t.Fatalf("tracker Create() error = %v", err)
+		}
+		return true, dropped, nil
+	})
+	rollbackErr := errors.New("rollback failed")
+	coreClient.PrependReactor("delete", "jobs", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, rollbackErr
+	})
+
+	cleanupSafe, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(context.Background(), job)
+	if !errors.Is(err, rollbackErr) {
+		t.Fatalf("CreateChildJob() error = %v, want rollback error", err)
+	}
+	if cleanupSafe {
+		t.Fatal("CreateChildJob() reported safe dependency cleanup after rollback failed")
 	}
 }

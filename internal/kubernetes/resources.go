@@ -154,39 +154,49 @@ func BuildPreprovisionedVolumeSnapshot(name, namespace, contentName, runID, runn
 	}}
 }
 
-func BuildRestorePVC(name, namespace string, sourcePVC *corev1.PersistentVolumeClaim, snapshotName, storageClassOverride, runID, runnerScope string) (*corev1.PersistentVolumeClaim, error) {
-	if sourcePVC == nil {
+type RestorePVCOptions struct {
+	Name                 string
+	Namespace            string
+	SourcePVC            *corev1.PersistentVolumeClaim
+	SnapshotName         string
+	StorageClassOverride string
+	RunID                string
+	RunnerScope          string
+}
+
+func BuildRestorePVC(opts RestorePVCOptions) (*corev1.PersistentVolumeClaim, error) {
+	if opts.SourcePVC == nil {
 		return nil, fmt.Errorf("source PVC is nil")
 	}
-	if sourcePVC.Spec.VolumeMode != nil && *sourcePVC.Spec.VolumeMode == corev1.PersistentVolumeBlock {
+	if opts.SourcePVC.Spec.VolumeMode != nil && *opts.SourcePVC.Spec.VolumeMode == corev1.PersistentVolumeBlock {
 		return nil, fmt.Errorf("block-mode PVCs are not supported by longhorn_pvc backups")
 	}
-	storageRequest, ok := sourcePVC.Spec.Resources.Requests[corev1.ResourceStorage]
+	storageRequest, ok := opts.SourcePVC.Spec.Resources.Requests[corev1.ResourceStorage]
 	if !ok || storageRequest.IsZero() {
-		return nil, fmt.Errorf("source PVC %s/%s has no storage request", sourcePVC.Namespace, sourcePVC.Name)
+		return nil, fmt.Errorf("source PVC %s/%s has no storage request", opts.SourcePVC.Namespace, opts.SourcePVC.Name)
 	}
 	var storageClassName *string
-	if storageClassOverride != "" {
-		storageClassName = &storageClassOverride
-	} else if sourcePVC.Spec.StorageClassName != nil {
-		storageClass := *sourcePVC.Spec.StorageClassName
+	if opts.StorageClassOverride != "" {
+		storageClassName = &opts.StorageClassOverride
+	} else if opts.SourcePVC.Spec.StorageClassName != nil {
+		storageClass := *opts.SourcePVC.Spec.StorageClassName
 		storageClassName = &storageClass
 	}
 	apiGroup := SnapshotAPIGroup
 	pvc := &corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: namespace,
-			Labels: managedLabels(runID, runnerScope),
+			Name: opts.Name, Namespace: opts.Namespace,
+			Labels: managedLabels(opts.RunID, opts.RunnerScope),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: sourcePVC.Spec.AccessModes, StorageClassName: storageClassName,
+			AccessModes: opts.SourcePVC.Spec.AccessModes, StorageClassName: storageClassName,
 			Resources:  corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: storageRequest}},
-			DataSource: &corev1.TypedLocalObjectReference{APIGroup: &apiGroup, Kind: VolumeSnapshotKind, Name: snapshotName},
+			DataSource: &corev1.TypedLocalObjectReference{APIGroup: &apiGroup, Kind: VolumeSnapshotKind, Name: opts.SnapshotName},
 		},
 	}
-	if sourcePVC.Spec.VolumeMode != nil {
-		mode := *sourcePVC.Spec.VolumeMode
+	if opts.SourcePVC.Spec.VolumeMode != nil {
+		mode := *opts.SourcePVC.Spec.VolumeMode
 		pvc.Spec.VolumeMode = &mode
 	}
 	return pvc, nil

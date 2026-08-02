@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ionutbalutoiu/home-backup/internal/backup"
+	appconfig "github.com/ionutbalutoiu/home-backup/internal/config"
 	homekube "github.com/ionutbalutoiu/home-backup/internal/kubernetes"
 	"gopkg.in/yaml.v3"
 	batchv1 "k8s.io/api/batch/v1"
@@ -24,9 +25,9 @@ import (
 
 const (
 	cleanupTimeout         = 2 * time.Minute
-	childShutdownTimeout   = time.Duration(homekube.ChildJobTerminationGraceSeconds)*time.Second + 15*time.Second
+	childShutdownTimeout   = homekube.ChildJobDeletionTimeout
 	staleRunAge            = 24 * time.Hour
-	maxLonghornWaitTimeout = staleRunAge / 4
+	maxLonghornWaitTimeout = appconfig.MaxLonghornPVCTimeout
 	maxLiveRunDuration     = 20 * time.Hour
 )
 
@@ -55,12 +56,12 @@ type Cluster interface {
 	GetPVC(context.Context, string, string) (*corev1.PersistentVolumeClaim, error)
 	CreateSnapshot(context.Context, homekube.SnapshotSpec) error
 	WaitSnapshotReady(context.Context, string, string, time.Duration) error
-	CreateSnapshotAliasContent(context.Context, homekube.SnapshotAliasSpec) error
+	CreateSnapshotAliasContent(context.Context, homekube.SnapshotAliasSpec) (dependencyCleanupSafe bool, err error)
 	CreateSnapshotAlias(context.Context, homekube.SnapshotAliasSpec) error
-	CreateRestoredPVC(context.Context, homekube.RestorePVCOptions) error
+	CreateRestoredPVC(context.Context, *corev1.PersistentVolumeClaim) error
 	CreateChildConfigSecret(context.Context, *corev1.Secret) error
 	ValidateChildJob(context.Context, *batchv1.Job) error
-	CreateChildJob(context.Context, *batchv1.Job) error
+	CreateChildJob(context.Context, *batchv1.Job) (dependencyCleanupSafe bool, err error)
 	WaitJobFinished(context.Context, string, string, time.Duration) (bool, error)
 	JobPodLogs(context.Context, string, string, string) (string, error)
 	DeleteJob(context.Context, string, string, string, string) error
@@ -96,7 +97,7 @@ func WithLogger(logger *slog.Logger) Option {
 // NewJob constructs a Longhorn PVC backup job.
 func NewJob(config Config, destination ResticDestination, cluster Cluster, runnerNamespace string, options ...Option) (*Job, error) {
 	if cluster == nil {
-		return nil, errors.New("Longhorn cluster is required")
+		return nil, errors.New("longhorn cluster is required")
 	}
 	if runnerNamespace == "" {
 		return nil, errors.New("runner namespace is required")
@@ -105,10 +106,13 @@ func NewJob(config Config, destination ResticDestination, cluster Cluster, runne
 		return nil, errors.New("PVC name, snapshot class, mount path, container name, and positive timeout are required")
 	}
 	if config.Timeout > maxLonghornWaitTimeout {
-		return nil, fmt.Errorf("Longhorn PVC timeout must not exceed %s so a live run cannot outlast the %s stale-reconciliation safety window", maxLonghornWaitTimeout, staleRunAge)
+		return nil, fmt.Errorf("longhorn PVC timeout must not exceed %s so a live run cannot outlast the %s stale-reconciliation safety window", maxLonghornWaitTimeout, staleRunAge)
 	}
 	if destination.Repo == "" {
-		return nil, errors.New("Restic repository is required")
+		return nil, errors.New("restic repository is required")
+	}
+	if destination.KeepLast < 0 {
+		return nil, errors.New("restic keep_last cannot be negative")
 	}
 	if err := ValidateResticGroupBy(destination.GroupBy); err != nil {
 		return nil, err
@@ -185,17 +189,14 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 		Name: tempPVCName, Namespace: j.runnerNamespace, SourcePVC: sourcePVC,
 		SnapshotName: restoreSnapshotName, StorageClassOverride: j.config.StorageClass, RunID: baseName, RunnerScope: runnerScope,
 	}
-	if _, err := homekube.BuildRestorePVC(
-		restorePVCOptions.Name, restorePVCOptions.Namespace, restorePVCOptions.SourcePVC,
-		restorePVCOptions.SnapshotName, restorePVCOptions.StorageClassOverride, restorePVCOptions.RunID, restorePVCOptions.RunnerScope,
-	); err != nil {
+	restoredPVC, err := homekube.BuildRestorePVC(restorePVCOptions)
+	if err != nil {
 		return fmt.Errorf("validate restored PVC: %w", err)
 	}
 	childJobOptions := homekube.ChildJobOptions{
 		Name: childJobName, RunID: baseName, CronJob: cronJob, ContainerName: j.config.ContainerName,
 		TempPVCName: tempPVCName, MountPath: j.config.MountPath, ChildConfigSecretName: childConfigSecretName,
-		ResticHost:  resticHostIdentity(sourceNamespace, j.config.PVCName),
-		RunnerScope: runnerScope,
+		ResticHost: resticHostIdentity(sourceNamespace, j.config.PVCName),
 	}
 	childJob, err := homekube.BuildChildJob(childJobOptions)
 	if err != nil {
@@ -206,44 +207,22 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 	}
 	childConfigSecret := homekube.BuildChildConfigSecret(childConfigSecretName, j.runnerNamespace, childConfig, baseName, runnerScope)
 
-	boundedCleanup := j.cleanupTimeout
-	if boundedCleanup <= 0 {
-		boundedCleanup = cleanupTimeout
-	}
-	var cleanup []cleanupFunc
-	createOutcomeUnresolved := false
-	childJobCleanupArmed := false
-	jobTerminal := false
+	lifecycle := runLifecycle{dependencyCleanupTimeout: j.cleanupTimeout}
 	defer func() {
-		if createOutcomeUnresolved {
-			retErr = errors.Join(retErr, errors.New("cleanup stopped to preserve dependent resources: Kubernetes create outcome is unresolved; stale reconciliation will recover the run after its safety window"))
-			return
-		}
-		if childJobCleanupArmed {
-			childCtx, cancelChild := context.WithTimeout(context.WithoutCancel(ctx), childShutdownTimeout)
-			childErr := j.cluster.DeleteJob(childCtx, j.runnerNamespace, childJobName, baseName, runnerScope)
-			cancelChild()
-			if childErr != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("cleanup stopped to preserve dependent resources: delete child Job: %w", childErr))
-				return
-			}
-		}
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), boundedCleanup)
-		defer cancel()
-		retErr = errors.Join(retErr, runCleanup(cleanupCtx, cleanup))
+		retErr = errors.Join(retErr, lifecycle.cleanup(ctx))
 	}()
 
-	cleanup = append(cleanup, func(ctx context.Context) error {
-		return j.cluster.DeleteSnapshot(ctx, sourceNamespace, sourceSnapshotName, baseName, runnerScope)
-	})
-	createOutcomeUnresolved = true
-	if err := j.cluster.CreateSnapshot(ctx, homekube.SnapshotSpec{
+	sourceSnapshotSpec := homekube.SnapshotSpec{
 		Name: sourceSnapshotName, Namespace: sourceNamespace,
 		PVCName: j.config.PVCName, SnapshotClass: j.config.SnapshotClass, RunID: baseName, RunnerScope: runnerScope,
+	}
+	if err := lifecycle.create(ctx, func(ctx context.Context) error {
+		return j.cluster.DeleteSnapshot(ctx, sourceNamespace, sourceSnapshotName, baseName, runnerScope)
+	}, func(ctx context.Context) error {
+		return j.cluster.CreateSnapshot(ctx, sourceSnapshotSpec)
 	}); err != nil {
 		return fmt.Errorf("create source VolumeSnapshot %s/%s: %w", sourceNamespace, sourceSnapshotName, err)
 	}
-	createOutcomeUnresolved = false
 	if err := j.cluster.WaitSnapshotReady(ctx, sourceNamespace, sourceSnapshotName, j.config.Timeout); err != nil {
 		return fmt.Errorf("wait for source VolumeSnapshot %s/%s: %w", sourceNamespace, sourceSnapshotName, err)
 	}
@@ -255,50 +234,47 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 			AliasContentName: aliasContentName, RunID: baseName,
 			RunnerScope: runnerScope,
 		}
-		cleanup = append(cleanup, func(ctx context.Context) error {
+		if err := lifecycle.createWithDisposition(ctx, func(ctx context.Context) error {
 			return j.cluster.DeleteSnapshotContent(ctx, aliasContentName, baseName, runnerScope, j.runnerNamespace)
-		})
-		createOutcomeUnresolved = true
-		if err := j.cluster.CreateSnapshotAliasContent(ctx, aliasSpec); err != nil {
+		}, func(ctx context.Context) (bool, error) {
+			return j.cluster.CreateSnapshotAliasContent(ctx, aliasSpec)
+		}); err != nil {
 			return fmt.Errorf("create VolumeSnapshotContent alias %s: %w", aliasContentName, err)
 		}
-		createOutcomeUnresolved = false
-		cleanup = append(cleanup, func(ctx context.Context) error {
+		if err := lifecycle.create(ctx, func(ctx context.Context) error {
 			return j.cluster.DeleteSnapshot(ctx, j.runnerNamespace, aliasSnapshotName, baseName, runnerScope)
-		})
-		createOutcomeUnresolved = true
-		if err := j.cluster.CreateSnapshotAlias(ctx, aliasSpec); err != nil {
+		}, func(ctx context.Context) error {
+			return j.cluster.CreateSnapshotAlias(ctx, aliasSpec)
+		}); err != nil {
 			return fmt.Errorf("create target VolumeSnapshot alias %s/%s: %w", j.runnerNamespace, aliasSnapshotName, err)
 		}
-		createOutcomeUnresolved = false
 		if err := j.cluster.WaitSnapshotReady(ctx, j.runnerNamespace, aliasSnapshotName, j.config.Timeout); err != nil {
 			return fmt.Errorf("wait for target VolumeSnapshot alias %s/%s: %w", j.runnerNamespace, aliasSnapshotName, err)
 		}
 	}
 
-	cleanup = append(cleanup, func(ctx context.Context) error {
+	if err := lifecycle.create(ctx, func(ctx context.Context) error {
 		return j.cluster.DeletePVC(ctx, j.runnerNamespace, tempPVCName, baseName, runnerScope)
-	})
-	createOutcomeUnresolved = true
-	if err := j.cluster.CreateRestoredPVC(ctx, restorePVCOptions); err != nil {
+	}, func(ctx context.Context) error {
+		return j.cluster.CreateRestoredPVC(ctx, restoredPVC)
+	}); err != nil {
 		return fmt.Errorf("create temporary PVC %s/%s: %w", j.runnerNamespace, tempPVCName, err)
 	}
-	createOutcomeUnresolved = false
-	cleanup = append(cleanup, func(ctx context.Context) error {
+	if err := lifecycle.create(ctx, func(ctx context.Context) error {
 		return j.cluster.DeleteSecret(ctx, j.runnerNamespace, childConfigSecretName, baseName, runnerScope)
-	})
-	createOutcomeUnresolved = true
-	if err := j.cluster.CreateChildConfigSecret(ctx, childConfigSecret); err != nil {
+	}, func(ctx context.Context) error {
+		return j.cluster.CreateChildConfigSecret(ctx, childConfigSecret)
+	}); err != nil {
 		return fmt.Errorf("create child config Secret %s/%s: %w", j.runnerNamespace, childConfigSecretName, err)
 	}
-	createOutcomeUnresolved = false
-	childJobCleanupArmed = true
-	createOutcomeUnresolved = true
-	if err := j.cluster.CreateChildJob(ctx, childJob); err != nil {
+	if err := lifecycle.createChildJob(ctx, func(ctx context.Context) error {
+		return j.cluster.DeleteJob(ctx, j.runnerNamespace, childJobName, baseName, runnerScope)
+	}, func(ctx context.Context) (bool, error) {
+		return j.cluster.CreateChildJob(ctx, childJob)
+	}); err != nil {
 		return fmt.Errorf("create child backup Job %s/%s: %w", j.runnerNamespace, childJobName, err)
 	}
-	createOutcomeUnresolved = false
-	jobTerminal, err = j.cluster.WaitJobFinished(ctx, j.runnerNamespace, childJobName, j.config.Timeout)
+	jobTerminal, err := j.cluster.WaitJobFinished(ctx, j.runnerNamespace, childJobName, j.config.Timeout)
 	if jobTerminal {
 		logs, logsErr := j.cluster.JobPodLogs(ctx, j.runnerNamespace, childJobName, baseName)
 		if err != nil {
@@ -326,6 +302,70 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 }
 
 type cleanupFunc func(context.Context) error
+
+type runLifecycle struct {
+	cleanups                 []cleanupFunc
+	preserveReason           error
+	childJobCleanup          cleanupFunc
+	dependencyCleanupTimeout time.Duration
+}
+
+func (l *runLifecycle) create(ctx context.Context, cleanup cleanupFunc, create func(context.Context) error) error {
+	l.cleanups = append(l.cleanups, cleanup)
+	l.preserveReason = errors.New("cleanup stopped to preserve dependent resources: Kubernetes create outcome is unresolved; stale reconciliation will recover the run after its safety window")
+	if err := create(ctx); err != nil {
+		return err
+	}
+	l.preserveReason = nil
+	return nil
+}
+
+func (l *runLifecycle) createWithDisposition(ctx context.Context, cleanup cleanupFunc, create func(context.Context) (dependencyCleanupSafe bool, err error)) error {
+	l.cleanups = append(l.cleanups, cleanup)
+	l.preserveReason = errors.New("cleanup stopped to preserve dependent resources: Kubernetes create outcome is unresolved; stale reconciliation will recover the run after its safety window")
+	dependencyCleanupSafe, err := create(ctx)
+	if dependencyCleanupSafe {
+		l.preserveReason = nil
+	}
+	if err == nil && !dependencyCleanupSafe {
+		return errors.New("kubernetes create returned an unresolved outcome without an error")
+	}
+	return err
+}
+
+func (l *runLifecycle) createChildJob(ctx context.Context, cleanup cleanupFunc, create func(context.Context) (dependencyCleanupSafe bool, err error)) error {
+	l.childJobCleanup = cleanup
+	l.preserveReason = errors.New("cleanup stopped to preserve dependent resources: child Job create or rollback outcome is unresolved; stale reconciliation will recover the run after its safety window")
+	dependencyCleanupSafe, err := create(ctx)
+	if dependencyCleanupSafe {
+		l.preserveReason = nil
+	}
+	if err == nil && !dependencyCleanupSafe {
+		return errors.New("child Job create returned an unresolved outcome without an error")
+	}
+	return err
+}
+
+func (l *runLifecycle) cleanup(ctx context.Context) error {
+	if l.preserveReason != nil {
+		return l.preserveReason
+	}
+	if l.childJobCleanup != nil {
+		childCtx, cancelChild := context.WithTimeout(context.WithoutCancel(ctx), childShutdownTimeout)
+		childErr := l.childJobCleanup(childCtx)
+		cancelChild()
+		if childErr != nil {
+			return fmt.Errorf("cleanup stopped to preserve dependent resources: delete child Job: %w", childErr)
+		}
+	}
+	cleanupDuration := l.dependencyCleanupTimeout
+	if cleanupDuration <= 0 {
+		cleanupDuration = cleanupTimeout
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupDuration)
+	defer cancel()
+	return runCleanup(cleanupCtx, l.cleanups)
+}
 
 func runCleanup(ctx context.Context, cleanup []cleanupFunc) error {
 	for i := len(cleanup) - 1; i >= 0; i-- {

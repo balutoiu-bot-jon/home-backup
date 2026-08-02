@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +13,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
@@ -22,10 +22,17 @@ const (
 	ChildLogCollectionTimeout   = 15 * time.Second
 	ChildLogContainerLimitBytes = 256 * 1024
 	ChildLogAggregateLimitBytes = 1024 * 1024
+	volumeSnapshotPollInterval  = 2 * time.Second
+	jobPollInterval             = 5 * time.Second
+	deletionPollInterval        = time.Second
 )
 
 func WaitVolumeSnapshotReady(ctx context.Context, clients *Clients, namespace, name string, timeout time.Duration) error {
-	return wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+	return waitVolumeSnapshotReady(ctx, clients, namespace, name, timeout, volumeSnapshotPollInterval)
+}
+
+func waitVolumeSnapshotReady(ctx context.Context, clients *Clients, namespace, name string, timeout, interval time.Duration) error {
+	return wait.PollUntilContextTimeout(ctx, interval, timeout, true, func(ctx context.Context) (bool, error) {
 		snapshot, err := clients.Dynamic.Resource(VolumeSnapshotGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			if isTransientKubernetesError(err) {
@@ -33,9 +40,18 @@ func WaitVolumeSnapshotReady(ctx context.Context, clients *Clients, namespace, n
 			}
 			return false, err
 		}
-		if message, found, err := unstructured.NestedString(snapshot.Object, "status", "error", "message"); err != nil {
+		_, hasSnapshotError, err := unstructured.NestedMap(snapshot.Object, "status", "error")
+		if err != nil {
 			return false, fmt.Errorf("reading VolumeSnapshot %s/%s error status: %w", namespace, name, err)
-		} else if found && message != "" {
+		}
+		if hasSnapshotError {
+			message, _, err := unstructured.NestedString(snapshot.Object, "status", "error", "message")
+			if err != nil {
+				return false, fmt.Errorf("reading VolumeSnapshot %s/%s error message: %w", namespace, name, err)
+			}
+			if message == "" {
+				return false, fmt.Errorf("VolumeSnapshot %s/%s failed without an error message", namespace, name)
+			}
 			return false, fmt.Errorf("VolumeSnapshot %s/%s failed: %s", namespace, name, message)
 		}
 		ready, found, err := unstructured.NestedBool(snapshot.Object, "status", "readyToUse")
@@ -57,11 +73,11 @@ func isTransientKubernetesError(err error) bool {
 	if errors.As(err, &status) && status.Status().Code >= 500 {
 		return true
 	}
-	var networkError net.Error
-	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
-		return true
-	}
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	return utilnet.IsTimeout(err) ||
+		utilnet.IsProbableEOF(err) ||
+		utilnet.IsConnectionReset(err) ||
+		utilnet.IsConnectionRefused(err) ||
+		utilnet.IsHTTP2ConnectionLost(err)
 }
 
 func GetBoundVolumeSnapshotContent(ctx context.Context, clients *Clients, namespace, name string) (*unstructured.Unstructured, error) {
@@ -103,8 +119,12 @@ func GetBoundVolumeSnapshotContent(ctx context.Context, clients *Clients, namesp
 }
 
 func WaitJobFinished(ctx context.Context, clients *Clients, namespace, name string, timeout time.Duration) (bool, error) {
+	return waitJobFinished(ctx, clients, namespace, name, timeout, jobPollInterval)
+}
+
+func waitJobFinished(ctx context.Context, clients *Clients, namespace, name string, timeout, interval time.Duration) (bool, error) {
 	terminal := false
-	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, interval, timeout, true, func(ctx context.Context) (bool, error) {
 		job, err := clients.Core.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			if isTransientKubernetesError(err) {
@@ -142,7 +162,11 @@ func DeleteJobIfOwned(ctx context.Context, clients *Clients, namespace, name, ru
 	if err := verifyRunnerOwnership(resource, job.Labels, runID, runnerScope); err != nil {
 		return err
 	}
-	uid := job.UID
+	return deleteJobWithUID(ctx, clients, namespace, name, job.UID)
+}
+
+func deleteJobWithUID(ctx context.Context, clients *Clients, namespace, name string, uid types.UID) error {
+	resource := fmt.Sprintf("Job %s/%s", namespace, name)
 	propagation := metav1.DeletePropagationForeground
 	if err := clients.Core.BatchV1().Jobs(namespace).Delete(ctx, name, metav1.DeleteOptions{
 		PropagationPolicy: &propagation,
@@ -162,7 +186,7 @@ func JobPodLogsIfOwned(ctx context.Context, clients *Clients, namespace, name, r
 
 func jobPodLogsIfOwned(ctx context.Context, clients *Clients, namespace, name, runID string, timeout time.Duration, aggregateLimit, containerLimit int64) (string, error) {
 	if clients.PodLogs == nil {
-		return "", errors.New("Kubernetes Pod log reader is not configured")
+		return "", errors.New("kubernetes Pod log reader is not configured")
 	}
 	if timeout <= 0 || aggregateLimit <= 0 || containerLimit <= 0 {
 		return "", errors.New("positive child log timeout and byte limits are required")
@@ -377,7 +401,7 @@ func verifyRunnerOwnership(resource string, labels map[string]string, runID, run
 }
 
 func waitForDeletion(ctx context.Context, resource string, get func(context.Context) error) error {
-	err := wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextCancel(ctx, deletionPollInterval, true, func(ctx context.Context) (bool, error) {
 		err := get(ctx)
 		if apierrors.IsNotFound(err) {
 			return true, nil

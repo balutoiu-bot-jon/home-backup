@@ -45,19 +45,19 @@ func (s Source) validate() error {
 		}
 	case SourceLonghornPVC:
 		if s.LonghornPVC == nil || s.Directory != nil || s.LVM != nil {
-			return errors.New("Longhorn PVC source variant is inconsistent")
+			return errors.New("longhorn PVC source variant is inconsistent")
 		}
 		if s.LonghornPVC.PVCName == "" {
-			return errors.New("Longhorn PVC source pvc_name is required")
+			return errors.New("longhorn PVC source pvc_name is required")
 		}
 		if s.LonghornPVC.SnapshotClass == "" {
-			return errors.New("Longhorn PVC source snapshot_class is required")
+			return errors.New("longhorn PVC source snapshot_class is required")
 		}
 		if s.LonghornPVC.MountPath == "" {
-			return errors.New("Longhorn PVC source mount_path is required")
+			return errors.New("longhorn PVC source mount_path is required")
 		}
 		if s.LonghornPVC.ContainerName == "" {
-			return errors.New("Longhorn PVC source container_name is required")
+			return errors.New("longhorn PVC source container_name is required")
 		}
 		if s.LonghornPVC.Namespace != "" {
 			if err := validateDNS1123Label("namespace", s.LonghornPVC.Namespace); err != nil {
@@ -84,16 +84,19 @@ func (s Source) validate() error {
 			return err
 		}
 		if !path.IsAbs(s.LonghornPVC.MountPath) {
-			return errors.New("Longhorn PVC source mount_path must be absolute")
+			return errors.New("longhorn PVC source mount_path must be absolute")
 		}
 		if s.LonghornPVC.MountPath == "/" {
-			return errors.New("Longhorn PVC source mount_path cannot be the filesystem root")
+			return errors.New("longhorn PVC source mount_path cannot be the filesystem root")
 		}
 		if path.Clean(s.LonghornPVC.MountPath) != s.LonghornPVC.MountPath {
-			return errors.New("Longhorn PVC source mount_path must not contain backsteps, duplicate separators, or a trailing separator")
+			return errors.New("longhorn PVC source mount_path must not contain backsteps, duplicate separators, or a trailing separator")
 		}
 		if s.LonghornPVC.Timeout <= 0 {
-			return errors.New("Longhorn PVC source timeout must be greater than zero")
+			return errors.New("longhorn PVC source timeout must be greater than zero")
+		}
+		if s.LonghornPVC.Timeout > MaxLonghornPVCTimeout {
+			return fmt.Errorf("longhorn PVC source timeout must not exceed %s", MaxLonghornPVCTimeout)
 		}
 	default:
 		return fmt.Errorf("unsupported source type %q", s.Kind)
@@ -103,14 +106,14 @@ func (s Source) validate() error {
 
 func validateDNS1123Subdomain(field, value string) error {
 	if problems := k8svalidation.IsDNS1123Subdomain(value); len(problems) > 0 {
-		return fmt.Errorf("Longhorn PVC source %s must be a valid DNS-1123 subdomain: %s", field, strings.Join(problems, "; "))
+		return fmt.Errorf("longhorn PVC source %s must be a valid DNS-1123 subdomain: %s", field, strings.Join(problems, "; "))
 	}
 	return nil
 }
 
 func validateDNS1123Label(field, value string) error {
 	if problems := k8svalidation.IsDNS1123Label(value); len(problems) > 0 {
-		return fmt.Errorf("Longhorn PVC source %s must be a valid DNS-1123 label: %s", field, strings.Join(problems, "; "))
+		return fmt.Errorf("longhorn PVC source %s must be a valid DNS-1123 label: %s", field, strings.Join(problems, "; "))
 	}
 	return nil
 }

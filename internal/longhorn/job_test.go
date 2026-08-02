@@ -22,30 +22,36 @@ import (
 )
 
 type recordingCluster struct {
-	calls              []string
-	failAt             map[string]error
-	cronJobNamespace   string
-	pvcNamespace       string
-	pvcName            string
-	snapshotSpec       homekube.SnapshotSpec
-	aliasContentSpec   homekube.SnapshotAliasSpec
-	aliasSnapshotSpec  homekube.SnapshotAliasSpec
-	restoredPVCOptions homekube.RestorePVCOptions
-	childJob           *batchv1.Job
-	childConfigSecret  *corev1.Secret
-	cronJob            *batchv1.CronJob
-	nonterminalWait    bool
-	jobLogs            string
-	deleteJobDelay     time.Duration
-	cleanupCanceled    bool
-	cleanupScopes      []string
-	aliasTargetNS      string
-	runDeadline        time.Time
-	hasRunDeadline     bool
+	calls                 []string
+	failAt                map[string]error
+	cronJobNamespace      string
+	pvcNamespace          string
+	pvcName               string
+	snapshotSpec          homekube.SnapshotSpec
+	aliasContentSpec      homekube.SnapshotAliasSpec
+	aliasSnapshotSpec     homekube.SnapshotAliasSpec
+	restoredPVC           *corev1.PersistentVolumeClaim
+	childJob              *batchv1.Job
+	childConfigSecret     *corev1.Secret
+	cronJob               *batchv1.CronJob
+	nonterminalWait       bool
+	jobLogs               string
+	deleteJobDelay        time.Duration
+	dependencyCleanupSafe bool
+	aliasCleanupSafe      bool
+	cleanupCanceled       bool
+	cleanupScopes         []string
+	aliasTargetNS         string
+	runDeadline           time.Time
+	hasRunDeadline        bool
+	onCall                func(string)
 }
 
 func (f *recordingCluster) record(call string) error {
 	f.calls = append(f.calls, call)
+	if f.onCall != nil {
+		f.onCall(call)
+	}
 	return f.failAt[call]
 }
 
@@ -108,16 +114,17 @@ func (f *recordingCluster) WaitSnapshotReady(_ context.Context, _ string, name s
 	}
 	return f.record("wait-source-snapshot")
 }
-func (f *recordingCluster) CreateSnapshotAliasContent(_ context.Context, spec homekube.SnapshotAliasSpec) error {
+func (f *recordingCluster) CreateSnapshotAliasContent(_ context.Context, spec homekube.SnapshotAliasSpec) (bool, error) {
 	f.aliasContentSpec = spec
-	return f.record("create-alias-content")
+	err := f.record("create-alias-content")
+	return err == nil || f.aliasCleanupSafe, err
 }
 func (f *recordingCluster) CreateSnapshotAlias(_ context.Context, spec homekube.SnapshotAliasSpec) error {
 	f.aliasSnapshotSpec = spec
 	return f.record("create-alias-snapshot")
 }
-func (f *recordingCluster) CreateRestoredPVC(_ context.Context, opts homekube.RestorePVCOptions) error {
-	f.restoredPVCOptions = opts
+func (f *recordingCluster) CreateRestoredPVC(_ context.Context, pvc *corev1.PersistentVolumeClaim) error {
+	f.restoredPVC = pvc.DeepCopy()
 	return f.record("create-pvc")
 }
 func (f *recordingCluster) CreateChildConfigSecret(_ context.Context, secret *corev1.Secret) error {
@@ -127,9 +134,10 @@ func (f *recordingCluster) CreateChildConfigSecret(_ context.Context, secret *co
 func (f *recordingCluster) ValidateChildJob(_ context.Context, _ *batchv1.Job) error {
 	return f.failAt["validate-job"]
 }
-func (f *recordingCluster) CreateChildJob(_ context.Context, job *batchv1.Job) error {
+func (f *recordingCluster) CreateChildJob(_ context.Context, job *batchv1.Job) (bool, error) {
 	f.childJob = job.DeepCopy()
-	return f.record("create-job")
+	err := f.record("create-job")
+	return err == nil || f.dependencyCleanupSafe, err
 }
 func (f *recordingCluster) WaitJobFinished(context.Context, string, string, time.Duration) (bool, error) {
 	return !f.nonterminalWait, f.record("wait-job")
@@ -211,6 +219,16 @@ func TestNewJobRejectsTimeoutThatCanOutliveStaleSafetyWindow(t *testing.T) {
 	}, ResticDestination{Repo: "s3:test", GroupBy: "host"}, &recordingCluster{}, "backup")
 	if err == nil || !strings.Contains(err.Error(), maxLonghornWaitTimeout.String()) {
 		t.Fatalf("NewJob() error = %v, want stale-window timeout rejection", err)
+	}
+}
+
+func TestNewJobRejectsNegativeRetention(t *testing.T) {
+	_, err := NewJob(Config{
+		PVCName: "data", SnapshotClass: "longhorn", MountPath: "/backup-source",
+		ContainerName: "home-backup", Timeout: time.Minute,
+	}, ResticDestination{Repo: "/repo", KeepLast: -1, GroupBy: "host"}, &recordingCluster{}, "runner")
+	if err == nil || !strings.Contains(err.Error(), "keep_last") {
+		t.Fatalf("NewJob() error = %v, want negative retention rejection", err)
 	}
 }
 
@@ -316,8 +334,8 @@ func TestJobCopiesCronJobSpecIntoChildJob(t *testing.T) {
 	if cluster.aliasContentSpec.TargetNamespace != "runner" || cluster.aliasContentSpec.SourceNamespace != "source" || cluster.aliasContentSpec.TargetSnapshotName != "home-backup-data-fixed-alias-snap" || cluster.aliasSnapshotSpec != cluster.aliasContentSpec {
 		t.Fatalf("snapshot aliases = %#v / %#v", cluster.aliasContentSpec, cluster.aliasSnapshotSpec)
 	}
-	if cluster.restoredPVCOptions.Namespace != "runner" || cluster.restoredPVCOptions.SnapshotName != "home-backup-data-fixed-alias-snap" {
-		t.Fatalf("restored PVC = %#v", cluster.restoredPVCOptions)
+	if cluster.restoredPVC == nil || cluster.restoredPVC.Namespace != "runner" || cluster.restoredPVC.Spec.DataSource == nil || cluster.restoredPVC.Spec.DataSource.Name != "home-backup-data-fixed-alias-snap" {
+		t.Fatalf("restored PVC = %#v", cluster.restoredPVC)
 	}
 	if cluster.childJob == nil || cluster.childJob.Name != "home-backup-data-fixed-job" || cluster.childJob.Namespace != "runner" {
 		t.Fatalf("child Job = %#v", cluster.childJob)
@@ -349,8 +367,8 @@ func TestJobSameNamespaceSkipsSnapshotAlias(t *testing.T) {
 			t.Fatalf("same-namespace run used alias operation %q", call)
 		}
 	}
-	if cluster.restoredPVCOptions.SnapshotName != "home-backup-data-fixed-source-snap" {
-		t.Fatalf("same-namespace restored PVC = %#v", cluster.restoredPVCOptions)
+	if cluster.restoredPVC == nil || cluster.restoredPVC.Spec.DataSource == nil || cluster.restoredPVC.Spec.DataSource.Name != "home-backup-data-fixed-source-snap" {
+		t.Fatalf("same-namespace restored PVC = %#v", cluster.restoredPVC)
 	}
 }
 
@@ -459,6 +477,35 @@ func TestJobAmbiguousCreatePreservesDependencies(t *testing.T) {
 	}
 }
 
+func TestJobCleanupSafeCreateFailureCleansDependencies(t *testing.T) {
+	cluster := &recordingCluster{
+		failAt:                map[string]error{"create-job": errors.New("incompatible persisted Job was removed")},
+		dependencyCleanupSafe: true,
+	}
+	err := newTestJob(cluster, "source").Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "incompatible persisted Job was removed") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	wantTail := []string{"delete-job", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}
+	if got := cluster.calls[len(cluster.calls)-len(wantTail):]; !reflect.DeepEqual(got, wantTail) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, wantTail)
+	}
+}
+
+func TestJobAliasPreparationFailureCleansSourceSnapshot(t *testing.T) {
+	cluster := &recordingCluster{
+		failAt:           map[string]error{"create-alias-content": errors.New("read bound snapshot content")},
+		aliasCleanupSafe: true,
+	}
+	err := newTestJob(cluster, "source").Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "read bound snapshot content") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := cluster.calls[len(cluster.calls)-1]; got != "delete-source-snapshot" {
+		t.Fatalf("calls = %#v, want source snapshot cleanup after pre-create failure", cluster.calls)
+	}
+}
+
 func TestJobCancellationAtEachAllocationStageUsesFreshDependencyOrderedCleanup(t *testing.T) {
 	for _, test := range []struct {
 		stage   string
@@ -474,8 +521,15 @@ func TestJobCancellationAtEachAllocationStageUsesFreshDependencyOrderedCleanup(t
 		{stage: "create-job"},
 	} {
 		t.Run(test.stage, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			cluster := &recordingCluster{failAt: map[string]error{test.stage: context.Canceled}}
-			err := newTestJob(cluster, "source").Run(context.Background())
+			cluster.onCall = func(call string) {
+				if call == test.stage {
+					cancel()
+				}
+			}
+			err := newTestJob(cluster, "source").Run(ctx)
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Run() error = %v", err)
 			}

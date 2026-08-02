@@ -35,7 +35,7 @@ func TestManagedResourceBuildersAddDurableRunnerScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildVolumeSnapshotAliasContent() error = %v", err)
 	}
-	restoredPVC, err := BuildRestorePVC("restored", "backup.runner", sourcePVC, "alias", "", "run-1", scope)
+	restoredPVC, err := BuildRestorePVC(RestorePVCOptions{Name: "restored", Namespace: "backup.runner", SourcePVC: sourcePVC, SnapshotName: "alias", RunID: "run-1", RunnerScope: scope})
 	if err != nil {
 		t.Fatalf("BuildRestorePVC() error = %v", err)
 	}
@@ -105,7 +105,7 @@ func TestBuildRestorePVCFromSnapshot(t *testing.T) {
 		},
 	}
 
-	pvc, err := BuildRestorePVC("restored", "backup", source, "snapshot", "", "run-1", RunnerScope("backup"))
+	pvc, err := BuildRestorePVC(RestorePVCOptions{Name: "restored", Namespace: "backup", SourcePVC: source, SnapshotName: "snapshot", RunID: "run-1", RunnerScope: RunnerScope("backup")})
 	if err != nil {
 		t.Fatalf("BuildRestorePVC() error = %v", err)
 	}

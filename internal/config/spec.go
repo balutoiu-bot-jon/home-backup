@@ -34,6 +34,8 @@ const (
 	DefaultLonghornPVCMountPath = "/backup-source"
 	// DefaultLonghornPVCTimeout bounds each Kubernetes readiness wait.
 	DefaultLonghornPVCTimeout = 30 * time.Minute
+	// MaxLonghornPVCTimeout keeps live runs below the stale-reconciliation safety window.
+	MaxLonghornPVCTimeout = 6 * time.Hour
 	// DefaultLonghornPVCContainerName selects the home-backup container in the copied CronJob spec.
 	DefaultLonghornPVCContainerName = "home-backup"
 )

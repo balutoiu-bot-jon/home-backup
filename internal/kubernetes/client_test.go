@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,6 +16,45 @@ import (
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 )
+
+func TestKubeconfigLoadsPathList(t *testing.T) {
+	dir := t.TempDir()
+	clustersPath := filepath.Join(dir, "clusters.yaml")
+	contextsPath := filepath.Join(dir, "contexts.yaml")
+	if err := os.WriteFile(clustersPath, []byte(`apiVersion: v1
+kind: Config
+clusters:
+- name: local
+  cluster:
+    server: https://local.example
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contextsPath, []byte(`apiVersion: v1
+kind: Config
+contexts:
+- name: local
+  context:
+    cluster: local
+    user: local
+current-context: local
+users:
+- name: local
+  user:
+    token: test-token
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KUBECONFIG", strings.Join([]string{clustersPath, contextsPath}, string(os.PathListSeparator)))
+
+	cfg, err := kubeconfig()
+	if err != nil {
+		t.Fatalf("kubeconfig() error = %v", err)
+	}
+	if cfg.Host != "https://local.example" || cfg.BearerToken != "test-token" {
+		t.Fatalf("kubeconfig() = host %q token %q", cfg.Host, cfg.BearerToken)
+	}
+}
 
 func TestLoadRESTConfigFallsBackOnlyWhenNotInCluster(t *testing.T) {
 	localCalled := false

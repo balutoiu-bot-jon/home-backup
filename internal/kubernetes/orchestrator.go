@@ -30,16 +30,6 @@ type SnapshotAliasSpec struct {
 	RunnerScope        string
 }
 
-type RestorePVCOptions struct {
-	Name                 string
-	Namespace            string
-	SourcePVC            *corev1.PersistentVolumeClaim
-	SnapshotName         string
-	StorageClassOverride string
-	RunID                string
-	RunnerScope          string
-}
-
 type LonghornCluster struct {
 	clients *Clients
 }
@@ -72,28 +62,25 @@ func (c *LonghornCluster) WaitSnapshotReady(ctx context.Context, namespace, name
 	return WaitVolumeSnapshotReady(ctx, c.clients, namespace, name, timeout)
 }
 
-func (c *LonghornCluster) CreateSnapshotAliasContent(ctx context.Context, spec SnapshotAliasSpec) error {
+func (c *LonghornCluster) CreateSnapshotAliasContent(ctx context.Context, spec SnapshotAliasSpec) (dependencyCleanupSafe bool, err error) {
 	sourceContent, err := GetBoundVolumeSnapshotContent(ctx, c.clients, spec.SourceNamespace, spec.SourceSnapshotName)
 	if err != nil {
-		return err
+		return true, err
 	}
 	aliasContent, err := BuildVolumeSnapshotAliasContent(spec.AliasContentName, spec.TargetSnapshotName, spec.TargetNamespace, sourceContent, spec.RunID, spec.RunnerScope)
 	if err != nil {
-		return err
+		return true, err
 	}
-	return CreateVolumeSnapshotContent(ctx, c.clients, aliasContent)
+	err = CreateVolumeSnapshotContent(ctx, c.clients, aliasContent)
+	return err == nil, err
 }
 
 func (c *LonghornCluster) CreateSnapshotAlias(ctx context.Context, spec SnapshotAliasSpec) error {
 	return CreateVolumeSnapshot(ctx, c.clients, BuildPreprovisionedVolumeSnapshot(spec.TargetSnapshotName, spec.TargetNamespace, spec.AliasContentName, spec.RunID, spec.RunnerScope))
 }
 
-func (c *LonghornCluster) CreateRestoredPVC(ctx context.Context, opts RestorePVCOptions) error {
-	pvc, err := BuildRestorePVC(opts.Name, opts.Namespace, opts.SourcePVC, opts.SnapshotName, opts.StorageClassOverride, opts.RunID, opts.RunnerScope)
-	if err != nil {
-		return err
-	}
-	_, err = c.clients.Core.CoreV1().PersistentVolumeClaims(opts.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
+func (c *LonghornCluster) CreateRestoredPVC(ctx context.Context, pvc *corev1.PersistentVolumeClaim) error {
+	_, err := c.clients.Core.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
 	return err
 }
 
@@ -108,22 +95,41 @@ func (c *LonghornCluster) ValidateChildJob(ctx context.Context, job *batchv1.Job
 		return fmt.Errorf("dry-run child Job compatibility probe: %w", err)
 	}
 	if probe.Spec.PodReplacementPolicy == nil || *probe.Spec.PodReplacementPolicy != batchv1.Failed {
-		return errors.New("Kubernetes API did not preserve podReplacementPolicy=Failed; Longhorn child Jobs require Kubernetes 1.34 or a cluster with the JobPodReplacementPolicy feature enabled")
+		return errors.New("kubernetes API did not preserve podReplacementPolicy=Failed; Longhorn child Jobs require Kubernetes 1.34 or a cluster with the JobPodReplacementPolicy feature enabled")
 	}
 	return nil
 }
 
-func (c *LonghornCluster) CreateChildJob(ctx context.Context, job *batchv1.Job) error {
+func (c *LonghornCluster) CreateChildJob(ctx context.Context, job *batchv1.Job) (dependencyCleanupSafe bool, err error) {
 	created, err := c.clients.Core.BatchV1().Jobs(job.Namespace).Create(ctx, job, metav1.CreateOptions{})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if created.Spec.PodReplacementPolicy == nil || *created.Spec.PodReplacementPolicy != batchv1.Failed {
 		compatErr := errors.New("persisted child Job lost podReplacementPolicy=Failed; Kubernetes 1.34 or JobPodReplacementPolicy support is required")
-		deleteErr := DeleteJobIfOwned(ctx, c.clients, created.Namespace, created.Name, created.Labels[RunLabel], created.Labels[RunnerScopeLabel])
-		return errors.Join(compatErr, deleteErr)
+		deleteErr := rollbackCreatedChildJob(ctx, c.clients, created)
+		return deleteErr == nil, errors.Join(compatErr, deleteErr)
 	}
-	return nil
+	return true, nil
+}
+
+func rollbackCreatedChildJob(ctx context.Context, clients *Clients, job *batchv1.Job) error {
+	resource := fmt.Sprintf("Job %s/%s", job.Namespace, job.Name)
+	if err := verifyRunnerOwnership(resource, job.Labels, job.Labels[RunLabel], job.Labels[RunnerScopeLabel]); err != nil {
+		return err
+	}
+	if job.UID == "" {
+		return fmt.Errorf("cannot roll back %s without its persisted UID", resource)
+	}
+	return rollbackChildJob(ctx, func(rollbackCtx context.Context) error {
+		return deleteJobWithUID(rollbackCtx, clients, job.Namespace, job.Name, job.UID)
+	})
+}
+
+func rollbackChildJob(ctx context.Context, rollback func(context.Context) error) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ChildJobDeletionTimeout)
+	defer cancel()
+	return rollback(rollbackCtx)
 }
 
 func (c *LonghornCluster) WaitJobFinished(ctx context.Context, namespace, name string, timeout time.Duration) (bool, error) {

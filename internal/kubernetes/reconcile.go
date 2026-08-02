@@ -14,10 +14,8 @@ import (
 )
 
 type reconciledRun struct {
-	active         bool
 	unsafe         bool
 	latestActivity time.Time
-	resources      []metav1.Object
 	jobs           []*batchv1.Job
 	secrets        []*corev1.Secret
 	pvcs           []*corev1.PersistentVolumeClaim
@@ -26,13 +24,13 @@ type reconciledRun struct {
 }
 
 const (
-	staleJobCleanupTimeout      = time.Duration(ChildJobTerminationGraceSeconds)*time.Second + 15*time.Second
+	staleJobCleanupTimeout      = ChildJobDeletionTimeout
 	staleResourceCleanupTimeout = 2 * time.Minute
 )
 
 func ReconcileStaleRuns(ctx context.Context, clients *Clients, runnerNamespace string, sourceNamespaces []string, staleAfter time.Duration) error {
 	if clients == nil || clients.Core == nil || clients.Dynamic == nil {
-		return fmt.Errorf("Kubernetes clients are required for stale-run reconciliation")
+		return fmt.Errorf("kubernetes clients are required for stale-run reconciliation")
 	}
 	if staleAfter <= 0 {
 		return fmt.Errorf("positive stale-run age is required")
@@ -54,7 +52,7 @@ func ReconcileStaleRuns(ctx context.Context, clients *Clients, runnerNamespace s
 			run = &reconciledRun{}
 			runs[runID] = run
 		}
-		run.resources = append(run.resources, object)
+		run.observe(object)
 		return run
 	}
 
@@ -70,7 +68,6 @@ func ReconcileStaleRuns(ctx context.Context, clients *Clients, runnerNamespace s
 		job := &jobs.Items[i]
 		if run := add(job); run != nil {
 			run.jobs = append(run.jobs, job)
-			run.active = run.active || job.Status.Active > 0
 			for _, condition := range job.Status.Conditions {
 				if condition.Status != corev1.ConditionTrue || (condition.Type != batchv1.JobComplete && condition.Type != batchv1.JobFailed) {
 					continue
@@ -154,7 +151,7 @@ func ReconcileStaleRuns(ctx context.Context, clients *Clients, runnerNamespace s
 	sort.Strings(runIDs)
 	for _, runID := range runIDs {
 		run := runs[runID]
-		if run.active || run.unsafe || !runIsOlderThan(run, cutoff) {
+		if run.unsafe || !runIsOlderThan(run, cutoff) {
 			continue
 		}
 		if err := reconcileAbandonedRun(ctx, clients, runnerNamespace, runID, run); err != nil {
@@ -268,18 +265,17 @@ func aliasContentTargetsNamespace(content *unstructured.Unstructured, namespace 
 	return err == nil && found && refNamespace == namespace
 }
 
+func (run *reconciledRun) observe(resource metav1.Object) {
+	created := resource.GetCreationTimestamp()
+	if created.IsZero() {
+		run.unsafe = true
+		return
+	}
+	if created.Time.After(run.latestActivity) {
+		run.latestActivity = created.Time
+	}
+}
+
 func runIsOlderThan(run *reconciledRun, cutoff time.Time) bool {
-	if len(run.resources) == 0 {
-		return false
-	}
-	if !run.latestActivity.IsZero() && !run.latestActivity.Before(cutoff) {
-		return false
-	}
-	for _, resource := range run.resources {
-		created := resource.GetCreationTimestamp()
-		if created.IsZero() || !created.Time.Before(cutoff) {
-			return false
-		}
-	}
-	return true
+	return !run.latestActivity.IsZero() && run.latestActivity.Before(cutoff)
 }

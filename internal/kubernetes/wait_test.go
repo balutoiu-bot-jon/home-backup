@@ -34,6 +34,20 @@ func TestWaitVolumeSnapshotReadyReturnsSnapshotError(t *testing.T) {
 	}
 }
 
+func TestWaitVolumeSnapshotReadyReturnsSnapshotErrorWithoutMessage(t *testing.T) {
+	snapshot := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": SnapshotAPIGroup + "/v1", "kind": VolumeSnapshotKind,
+		"metadata": map[string]any{"name": "snap-1", "namespace": "backup"},
+		"status":   map[string]any{"error": map[string]any{"time": "2026-08-02T00:00:00Z"}},
+	}}
+	clients := &Clients{Dynamic: dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), snapshot)}
+
+	err := WaitVolumeSnapshotReady(context.Background(), clients, "backup", "snap-1", time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "failed without an error message") {
+		t.Fatalf("WaitVolumeSnapshotReady() error = %v", err)
+	}
+}
+
 func TestWaitVolumeSnapshotReadyRetriesTransientRead(t *testing.T) {
 	snapshot := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": SnapshotAPIGroup + "/v1", "kind": VolumeSnapshotKind,
@@ -51,7 +65,7 @@ func TestWaitVolumeSnapshotReadyRetriesTransientRead(t *testing.T) {
 	})
 	clients := &Clients{Dynamic: dynamicClient}
 
-	if err := WaitVolumeSnapshotReady(context.Background(), clients, "backup", "snap-1", 3*time.Second); err != nil {
+	if err := waitVolumeSnapshotReady(context.Background(), clients, "backup", "snap-1", time.Second, time.Millisecond); err != nil {
 		t.Fatalf("WaitVolumeSnapshotReady() error = %v", err)
 	}
 	if attempts != 2 {
@@ -111,7 +125,7 @@ func TestWaitJobFinishedRetriesTransientRead(t *testing.T) {
 	})
 	clients := &Clients{Core: coreClient}
 
-	terminal, err := WaitJobFinished(context.Background(), clients, "backup", "child", 6*time.Second)
+	terminal, err := waitJobFinished(context.Background(), clients, "backup", "child", time.Second, time.Millisecond)
 	if err != nil || !terminal {
 		t.Fatalf("WaitJobFinished() = terminal %v, error %v", terminal, err)
 	}

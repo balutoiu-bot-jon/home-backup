@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -139,7 +138,7 @@ func ResolveCronJob(ctx context.Context, clients *Clients, namespace string) (*b
 		return nil, fmt.Errorf("getting Job %s/%s: %w", namespace, jobOwner.Name, err)
 	}
 	if jobOwner.UID != job.UID {
-		return nil, fmt.Errorf("Job %s/%s UID %q does not match Pod owner UID %q", namespace, job.Name, job.UID, jobOwner.UID)
+		return nil, fmt.Errorf("job %s/%s UID %q does not match Pod owner UID %q", namespace, job.Name, job.UID, jobOwner.UID)
 	}
 	cronJobOwner, err := controllerOwner(job.OwnerReferences, "CronJob")
 	if err != nil {
@@ -165,13 +164,8 @@ func controllerOwner(owners []metav1.OwnerReference, kind string) (*metav1.Owner
 }
 
 func kubeconfig() (*rest.Config, error) {
-	kubeconfigPath := os.Getenv("KUBECONFIG")
-	if kubeconfigPath == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		kubeconfigPath = filepath.Join(home, ".kube", "config")
-	}
-	return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
 }

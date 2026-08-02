@@ -72,7 +72,7 @@ func TestReconcileStaleRunsDeletesAbandonedResourcesInDependencyOrder(t *testing
 	}
 }
 
-func TestReconcileStaleRunsSkipsActiveAndYoungRuns(t *testing.T) {
+func TestReconcileStaleRunsCleansOldActiveAndSkipsYoungRuns(t *testing.T) {
 	now := time.Now()
 	managed := func(run string, created time.Time) metav1.ObjectMeta {
 		return metav1.ObjectMeta{
@@ -98,15 +98,21 @@ func TestReconcileStaleRunsSkipsActiveAndYoungRuns(t *testing.T) {
 	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
 		VolumeSnapshotGVR: "VolumeSnapshotList", VolumeSnapshotContentGVR: "VolumeSnapshotContentList",
 	}, snapshot)
-	failDelete := func(action clienttesting.Action) (bool, runtime.Object, error) {
-		t.Fatalf("unexpected delete of %s", action.GetResource().Resource)
-		return true, nil, nil
-	}
-	coreClient.PrependReactor("delete", "*", failDelete)
-	dynamicClient.PrependReactor("delete", "*", failDelete)
 
 	if err := ReconcileStaleRuns(context.Background(), &Clients{Core: coreClient, Dynamic: dynamicClient}, "backup", nil, 24*time.Hour); err != nil {
 		t.Fatalf("ReconcileStaleRuns() error = %v", err)
+	}
+	if _, err := coreClient.BatchV1().Jobs("backup").Get(context.Background(), "active-job", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("old active Job Get() error = %v, want NotFound", err)
+	}
+	if _, err := coreClient.CoreV1().Secrets("backup").Get(context.Background(), "active-secret", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("old active Secret Get() error = %v, want NotFound", err)
+	}
+	if _, err := dynamicClient.Resource(VolumeSnapshotGVR).Namespace("backup").Get(context.Background(), "active-snapshot", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("old active VolumeSnapshot Get() error = %v, want NotFound", err)
+	}
+	if _, err := coreClient.CoreV1().PersistentVolumeClaims("backup").Get(context.Background(), "young-pvc", metav1.GetOptions{}); err != nil {
+		t.Fatalf("young PVC Get() error = %v, want resource preserved", err)
 	}
 }
 

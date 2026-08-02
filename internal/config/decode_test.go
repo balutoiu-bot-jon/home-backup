@@ -155,6 +155,7 @@ func TestDecodeRejectsInvalidConfig(t *testing.T) {
 		{name: "missing PVC name", yaml: "backups:\n- source: {type: longhorn_pvc, snapshot_class: snap}\n  destination: {type: restic, repo: /repo}\n", want: "pvc_name is required"},
 		{name: "missing snapshot class", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data}\n  destination: {type: restic, repo: /repo}\n", want: "snapshot_class is required"},
 		{name: "non-positive Longhorn timeout", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, timeout: 0s}\n  destination: {type: restic, repo: /repo}\n", want: "timeout must be greater than zero"},
+		{name: "Longhorn timeout above maximum", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, timeout: 7h}\n  destination: {type: restic, repo: /repo}\n", want: "timeout must not exceed 6h"},
 		{name: "invalid Longhorn timeout", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: data, snapshot_class: snap, timeout: never}\n  destination: {type: restic, repo: /repo}\n", want: "parse timeout"},
 		{name: "invalid Longhorn namespace", yaml: "backups:\n- source: {type: longhorn_pvc, namespace: Bad_Name, pvc_name: data, snapshot_class: snap}\n  destination: {type: restic, repo: /repo}\n", want: "namespace must be a valid DNS-1123 label"},
 		{name: "invalid Longhorn PVC name", yaml: "backups:\n- source: {type: longhorn_pvc, pvc_name: Bad_Name, snapshot_class: snap}\n  destination: {type: restic, repo: /repo}\n", want: "pvc_name must be a valid DNS-1123 subdomain"},

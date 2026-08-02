@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/ionutbalutoiu/home-backup/internal/config"
 	batchv1 "k8s.io/api/batch/v1"
@@ -15,6 +16,7 @@ const (
 	ChildJobTerminationGraceSeconds int64 = 150
 	ParentMinimumGraceSeconds       int64 = 300
 	ChildConfigSecretKey                  = "config-b64"
+	ChildJobDeletionTimeout               = time.Duration(ChildJobTerminationGraceSeconds)*time.Second + 15*time.Second
 )
 
 type ChildJobOptions struct {
@@ -26,7 +28,6 @@ type ChildJobOptions struct {
 	MountPath             string
 	ChildConfigSecretName string
 	ResticHost            string
-	RunnerScope           string
 }
 
 func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
@@ -36,10 +37,7 @@ func BuildChildJob(opts ChildJobOptions) (*batchv1.Job, error) {
 	if opts.Name == "" || opts.RunID == "" || opts.CronJob.Namespace == "" || opts.TempPVCName == "" || opts.MountPath == "" || opts.ChildConfigSecretName == "" || opts.ResticHost == "" {
 		return nil, fmt.Errorf("child Job name, run ID, CronJob namespace, temporary PVC name, mount path, child config Secret name, and Restic host are required")
 	}
-	runnerScope := opts.RunnerScope
-	if runnerScope == "" {
-		runnerScope = RunnerScope(opts.CronJob.Namespace)
-	}
+	runnerScope := RunnerScope(opts.CronJob.Namespace)
 	parentGrace := opts.CronJob.Spec.JobTemplate.Spec.Template.Spec.TerminationGracePeriodSeconds
 	if parentGrace == nil || *parentGrace < ParentMinimumGraceSeconds {
 		return nil, fmt.Errorf("parent CronJob Job template terminationGracePeriodSeconds must be at least %d seconds (165-second foreground child Job deletion, 120-second dependency cleanup, and 15-second margin)", ParentMinimumGraceSeconds)
