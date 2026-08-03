@@ -64,12 +64,12 @@ func TestValidateThenCreateChildJobUsesDryRunOnlyForProbe(t *testing.T) {
 	if err := cluster.ValidateChildJob(context.Background(), job); err != nil {
 		t.Fatalf("ValidateChildJob() error = %v", err)
 	}
-	cleanupSafe, err := cluster.CreateChildJob(context.Background(), job)
+	disposition, err := cluster.CreateChildJob(context.Background(), job)
 	if err != nil {
 		t.Fatalf("CreateChildJob() error = %v", err)
 	}
-	if !cleanupSafe {
-		t.Fatal("CreateChildJob() reported that dependency cleanup was unsafe after a successful create")
+	if disposition != CreateKnownPresent {
+		t.Fatalf("CreateChildJob() disposition = %v, want known present", disposition)
 	}
 	if createCalls != 2 {
 		t.Fatalf("create calls = %d, want dry-run probe plus persisted create", createCalls)
@@ -94,12 +94,12 @@ func TestCreateChildJobDeletesPersistedJobIfActualResponseDropsReplacementPolicy
 		return true, dropped, nil
 	})
 
-	cleanupSafe, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(context.Background(), job)
+	disposition, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(context.Background(), job)
 	if err == nil || !strings.Contains(err.Error(), "persisted child Job lost podReplacementPolicy") {
 		t.Fatalf("CreateChildJob() error = %v, want persisted compatibility error", err)
 	}
-	if !cleanupSafe {
-		t.Fatal("CreateChildJob() reported that dependency cleanup was unsafe after deleting the incompatible Job")
+	if disposition != CreateKnownAbsent {
+		t.Fatalf("CreateChildJob() disposition = %v, want known absent after rollback", disposition)
 	}
 	if _, getErr := coreClient.BatchV1().Jobs(job.Namespace).Get(context.Background(), job.Name, metav1.GetOptions{}); !apierrors.IsNotFound(getErr) {
 		t.Fatalf("incompatible persisted Job Get() error = %v, want NotFound after foreground deletion", getErr)
@@ -145,12 +145,12 @@ func TestCreateChildJobRollsBackWithFreshContextAfterCancellation(t *testing.T) 
 		return true, dropped, nil
 	})
 
-	cleanupSafe, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(ctx, job)
+	disposition, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(ctx, job)
 	if err == nil || !strings.Contains(err.Error(), "persisted child Job lost podReplacementPolicy") {
 		t.Fatalf("CreateChildJob() error = %v, want persisted compatibility error", err)
 	}
-	if !cleanupSafe {
-		t.Fatal("CreateChildJob() reported unsafe dependency cleanup after cancellation-independent rollback")
+	if disposition != CreateKnownAbsent {
+		t.Fatalf("CreateChildJob() disposition = %v, want known absent after cancellation-independent rollback", disposition)
 	}
 	if _, getErr := coreClient.BatchV1().Jobs(job.Namespace).Get(context.Background(), job.Name, metav1.GetOptions{}); !apierrors.IsNotFound(getErr) {
 		t.Fatalf("incompatible persisted Job Get() error = %v, want NotFound after rollback", getErr)
@@ -179,11 +179,11 @@ func TestCreateChildJobReportsUnsafeDependencyCleanupWhenRollbackFails(t *testin
 		return true, nil, rollbackErr
 	})
 
-	cleanupSafe, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(context.Background(), job)
+	disposition, err := (&LonghornCluster{clients: &Clients{Core: coreClient}}).CreateChildJob(context.Background(), job)
 	if !errors.Is(err, rollbackErr) {
 		t.Fatalf("CreateChildJob() error = %v, want rollback error", err)
 	}
-	if cleanupSafe {
-		t.Fatal("CreateChildJob() reported safe dependency cleanup after rollback failed")
+	if disposition != CreateUnknown {
+		t.Fatalf("CreateChildJob() disposition = %v, want unknown after rollback failed", disposition)
 	}
 }

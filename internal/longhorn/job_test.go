@@ -114,10 +114,16 @@ func (f *recordingCluster) WaitSnapshotReady(_ context.Context, _ string, name s
 	}
 	return f.record("wait-source-snapshot")
 }
-func (f *recordingCluster) CreateSnapshotAliasContent(_ context.Context, spec homekube.SnapshotAliasSpec) (bool, error) {
+func (f *recordingCluster) CreateSnapshotAliasContent(_ context.Context, spec homekube.SnapshotAliasSpec) (homekube.CreateDisposition, error) {
 	f.aliasContentSpec = spec
 	err := f.record("create-alias-content")
-	return err == nil || f.aliasCleanupSafe, err
+	if err == nil {
+		return homekube.CreateKnownPresent, nil
+	}
+	if f.aliasCleanupSafe {
+		return homekube.CreateKnownAbsent, err
+	}
+	return homekube.CreateUnknown, err
 }
 func (f *recordingCluster) CreateSnapshotAlias(_ context.Context, spec homekube.SnapshotAliasSpec) error {
 	f.aliasSnapshotSpec = spec
@@ -134,10 +140,16 @@ func (f *recordingCluster) CreateChildConfigSecret(_ context.Context, secret *co
 func (f *recordingCluster) ValidateChildJob(_ context.Context, _ *batchv1.Job) error {
 	return f.failAt["validate-job"]
 }
-func (f *recordingCluster) CreateChildJob(_ context.Context, job *batchv1.Job) (bool, error) {
+func (f *recordingCluster) CreateChildJob(_ context.Context, job *batchv1.Job) (homekube.CreateDisposition, error) {
 	f.childJob = job.DeepCopy()
 	err := f.record("create-job")
-	return err == nil || f.dependencyCleanupSafe, err
+	if err == nil {
+		return homekube.CreateKnownPresent, nil
+	}
+	if f.dependencyCleanupSafe {
+		return homekube.CreateKnownAbsent, err
+	}
+	return homekube.CreateUnknown, err
 }
 func (f *recordingCluster) WaitJobFinished(context.Context, string, string, time.Duration) (bool, error) {
 	return !f.nonterminalWait, f.record("wait-job")
@@ -477,7 +489,7 @@ func TestJobAmbiguousCreatePreservesDependencies(t *testing.T) {
 	}
 }
 
-func TestJobCleanupSafeCreateFailureCleansDependencies(t *testing.T) {
+func TestJobConfirmedRollbackSkipsRedundantJobDeleteAndCleansDependencies(t *testing.T) {
 	cluster := &recordingCluster{
 		failAt:                map[string]error{"create-job": errors.New("incompatible persisted Job was removed")},
 		dependencyCleanupSafe: true,
@@ -486,7 +498,7 @@ func TestJobCleanupSafeCreateFailureCleansDependencies(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "incompatible persisted Job was removed") {
 		t.Fatalf("Run() error = %v", err)
 	}
-	wantTail := []string{"delete-job", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}
+	wantTail := []string{"create-job", "delete-secret", "delete-pvc", "delete-alias-snapshot", "delete-alias-content", "delete-source-snapshot"}
 	if got := cluster.calls[len(cluster.calls)-len(wantTail):]; !reflect.DeepEqual(got, wantTail) {
 		t.Fatalf("cleanup calls = %#v, want %#v", got, wantTail)
 	}
@@ -494,15 +506,19 @@ func TestJobCleanupSafeCreateFailureCleansDependencies(t *testing.T) {
 
 func TestJobAliasPreparationFailureCleansSourceSnapshot(t *testing.T) {
 	cluster := &recordingCluster{
-		failAt:           map[string]error{"create-alias-content": errors.New("read bound snapshot content")},
+		failAt: map[string]error{
+			"create-alias-content": errors.New("read bound snapshot content"),
+			"delete-alias-content": errors.New("alias content GET is forbidden"),
+		},
 		aliasCleanupSafe: true,
 	}
 	err := newTestJob(cluster, "source").Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "read bound snapshot content") {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if got := cluster.calls[len(cluster.calls)-1]; got != "delete-source-snapshot" {
-		t.Fatalf("calls = %#v, want source snapshot cleanup after pre-create failure", cluster.calls)
+	wantTail := []string{"create-alias-content", "delete-source-snapshot"}
+	if got := cluster.calls[len(cluster.calls)-len(wantTail):]; !reflect.DeepEqual(got, wantTail) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, wantTail)
 	}
 }
 

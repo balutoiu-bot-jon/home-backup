@@ -30,6 +30,16 @@ type SnapshotAliasSpec struct {
 	RunnerScope        string
 }
 
+// CreateDisposition reports whether a resource is conclusively absent, present,
+// or unresolved after a create operation returns.
+type CreateDisposition int
+
+const (
+	CreateUnknown CreateDisposition = iota
+	CreateKnownAbsent
+	CreateKnownPresent
+)
+
 type LonghornCluster struct {
 	clients *Clients
 }
@@ -62,17 +72,19 @@ func (c *LonghornCluster) WaitSnapshotReady(ctx context.Context, namespace, name
 	return WaitVolumeSnapshotReady(ctx, c.clients, namespace, name, timeout)
 }
 
-func (c *LonghornCluster) CreateSnapshotAliasContent(ctx context.Context, spec SnapshotAliasSpec) (dependencyCleanupSafe bool, err error) {
+func (c *LonghornCluster) CreateSnapshotAliasContent(ctx context.Context, spec SnapshotAliasSpec) (CreateDisposition, error) {
 	sourceContent, err := GetBoundVolumeSnapshotContent(ctx, c.clients, spec.SourceNamespace, spec.SourceSnapshotName)
 	if err != nil {
-		return true, err
+		return CreateKnownAbsent, err
 	}
 	aliasContent, err := BuildVolumeSnapshotAliasContent(spec.AliasContentName, spec.TargetSnapshotName, spec.TargetNamespace, sourceContent, spec.RunID, spec.RunnerScope)
 	if err != nil {
-		return true, err
+		return CreateKnownAbsent, err
 	}
-	err = CreateVolumeSnapshotContent(ctx, c.clients, aliasContent)
-	return err == nil, err
+	if err := CreateVolumeSnapshotContent(ctx, c.clients, aliasContent); err != nil {
+		return CreateUnknown, err
+	}
+	return CreateKnownPresent, nil
 }
 
 func (c *LonghornCluster) CreateSnapshotAlias(ctx context.Context, spec SnapshotAliasSpec) error {
@@ -100,17 +112,20 @@ func (c *LonghornCluster) ValidateChildJob(ctx context.Context, job *batchv1.Job
 	return nil
 }
 
-func (c *LonghornCluster) CreateChildJob(ctx context.Context, job *batchv1.Job) (dependencyCleanupSafe bool, err error) {
+func (c *LonghornCluster) CreateChildJob(ctx context.Context, job *batchv1.Job) (CreateDisposition, error) {
 	created, err := c.clients.Core.BatchV1().Jobs(job.Namespace).Create(ctx, job, metav1.CreateOptions{})
 	if err != nil {
-		return false, err
+		return CreateUnknown, err
 	}
 	if created.Spec.PodReplacementPolicy == nil || *created.Spec.PodReplacementPolicy != batchv1.Failed {
 		compatErr := errors.New("persisted child Job lost podReplacementPolicy=Failed; Kubernetes 1.34 or JobPodReplacementPolicy support is required")
 		deleteErr := rollbackCreatedChildJob(ctx, c.clients, created)
-		return deleteErr == nil, errors.Join(compatErr, deleteErr)
+		if deleteErr != nil {
+			return CreateUnknown, errors.Join(compatErr, deleteErr)
+		}
+		return CreateKnownAbsent, compatErr
 	}
-	return true, nil
+	return CreateKnownPresent, nil
 }
 
 func rollbackCreatedChildJob(ctx context.Context, clients *Clients, job *batchv1.Job) error {

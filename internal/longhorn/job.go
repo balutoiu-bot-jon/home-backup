@@ -56,12 +56,12 @@ type Cluster interface {
 	GetPVC(context.Context, string, string) (*corev1.PersistentVolumeClaim, error)
 	CreateSnapshot(context.Context, homekube.SnapshotSpec) error
 	WaitSnapshotReady(context.Context, string, string, time.Duration) error
-	CreateSnapshotAliasContent(context.Context, homekube.SnapshotAliasSpec) (dependencyCleanupSafe bool, err error)
+	CreateSnapshotAliasContent(context.Context, homekube.SnapshotAliasSpec) (homekube.CreateDisposition, error)
 	CreateSnapshotAlias(context.Context, homekube.SnapshotAliasSpec) error
 	CreateRestoredPVC(context.Context, *corev1.PersistentVolumeClaim) error
 	CreateChildConfigSecret(context.Context, *corev1.Secret) error
 	ValidateChildJob(context.Context, *batchv1.Job) error
-	CreateChildJob(context.Context, *batchv1.Job) (dependencyCleanupSafe bool, err error)
+	CreateChildJob(context.Context, *batchv1.Job) (homekube.CreateDisposition, error)
 	WaitJobFinished(context.Context, string, string, time.Duration) (bool, error)
 	JobPodLogs(context.Context, string, string, string) (string, error)
 	DeleteJob(context.Context, string, string, string, string) error
@@ -236,7 +236,7 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 		}
 		if err := lifecycle.createWithDisposition(ctx, func(ctx context.Context) error {
 			return j.cluster.DeleteSnapshotContent(ctx, aliasContentName, baseName, runnerScope, j.runnerNamespace)
-		}, func(ctx context.Context) (bool, error) {
+		}, func(ctx context.Context) (homekube.CreateDisposition, error) {
 			return j.cluster.CreateSnapshotAliasContent(ctx, aliasSpec)
 		}); err != nil {
 			return fmt.Errorf("create VolumeSnapshotContent alias %s: %w", aliasContentName, err)
@@ -269,7 +269,7 @@ func (j *Job) Run(ctx context.Context) (retErr error) {
 	}
 	if err := lifecycle.createChildJob(ctx, func(ctx context.Context) error {
 		return j.cluster.DeleteJob(ctx, j.runnerNamespace, childJobName, baseName, runnerScope)
-	}, func(ctx context.Context) (bool, error) {
+	}, func(ctx context.Context) (homekube.CreateDisposition, error) {
 		return j.cluster.CreateChildJob(ctx, childJob)
 	}); err != nil {
 		return fmt.Errorf("create child backup Job %s/%s: %w", j.runnerNamespace, childJobName, err)
@@ -320,28 +320,40 @@ func (l *runLifecycle) create(ctx context.Context, cleanup cleanupFunc, create f
 	return nil
 }
 
-func (l *runLifecycle) createWithDisposition(ctx context.Context, cleanup cleanupFunc, create func(context.Context) (dependencyCleanupSafe bool, err error)) error {
-	l.cleanups = append(l.cleanups, cleanup)
+func (l *runLifecycle) createWithDisposition(ctx context.Context, cleanup cleanupFunc, create func(context.Context) (homekube.CreateDisposition, error)) error {
 	l.preserveReason = errors.New("cleanup stopped to preserve dependent resources: Kubernetes create outcome is unresolved; stale reconciliation will recover the run after its safety window")
-	dependencyCleanupSafe, err := create(ctx)
-	if dependencyCleanupSafe {
+	disposition, err := create(ctx)
+	switch disposition {
+	case homekube.CreateKnownPresent:
+		l.cleanups = append(l.cleanups, cleanup)
 		l.preserveReason = nil
+	case homekube.CreateKnownAbsent:
+		l.preserveReason = nil
+	case homekube.CreateUnknown:
+	default:
+		return fmt.Errorf("invalid Kubernetes create disposition %d", disposition)
 	}
-	if err == nil && !dependencyCleanupSafe {
-		return errors.New("kubernetes create returned an unresolved outcome without an error")
+	if err == nil && disposition != homekube.CreateKnownPresent {
+		return fmt.Errorf("kubernetes create returned disposition %d without an error", disposition)
 	}
 	return err
 }
 
-func (l *runLifecycle) createChildJob(ctx context.Context, cleanup cleanupFunc, create func(context.Context) (dependencyCleanupSafe bool, err error)) error {
-	l.childJobCleanup = cleanup
+func (l *runLifecycle) createChildJob(ctx context.Context, cleanup cleanupFunc, create func(context.Context) (homekube.CreateDisposition, error)) error {
 	l.preserveReason = errors.New("cleanup stopped to preserve dependent resources: child Job create or rollback outcome is unresolved; stale reconciliation will recover the run after its safety window")
-	dependencyCleanupSafe, err := create(ctx)
-	if dependencyCleanupSafe {
+	disposition, err := create(ctx)
+	switch disposition {
+	case homekube.CreateKnownPresent:
+		l.childJobCleanup = cleanup
 		l.preserveReason = nil
+	case homekube.CreateKnownAbsent:
+		l.preserveReason = nil
+	case homekube.CreateUnknown:
+	default:
+		return fmt.Errorf("invalid child Job create disposition %d", disposition)
 	}
-	if err == nil && !dependencyCleanupSafe {
-		return errors.New("child Job create returned an unresolved outcome without an error")
+	if err == nil && disposition != homekube.CreateKnownPresent {
+		return fmt.Errorf("child Job create returned disposition %d without an error", disposition)
 	}
 	return err
 }
